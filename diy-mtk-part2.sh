@@ -13,5 +13,7 @@
 # 替换默认IP
 sed -i 's#192.168.1.1#192.168.0.1#g' package/base-files/files/bin/config_generate
 
-# Rust 编译器参数设为download-ci-llvm = "if-unchanged"
-sed -i 's/--set=llvm\.download-ci-llvm=true \\/--set=llvm.download-ci-llvm=if-unchanged \\/' feeds/packages/lang/rust/Makefile
+# Rust 编译器参数改成 download-ci-llvm = false，自己编译 LLVM
+sed -i 's/--set=llvm\.download-ci-llvm=.*\\/--set=llvm.download-ci-llvm=false \\/' feeds/packages/lang/rust/Makefile
+sed -i '/--set=llvm.download-ci-llvm=false \\/a \ \ \ \ --set=llvm.build=true \\' feeds/packages/lang/rust/Makefile
+

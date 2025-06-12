@@ -14,10 +14,11 @@
 sed -i 's#192.168.1.1#192.168.0.1#g' package/base-files/files/bin/config_generate
 
 # Rust 编译器参数改成 download-ci-llvm = false，自己编译 LLVM
-# 删除 download-ci-llvm 的设置（无论 true 或 if-unchanged）
+# ✅ 1. 将 --set=llvm.download-ci-llvm=xxx 改为 false（无论是 true 还是 if-unchanged）
 sed -i 's/--set=llvm\.download-ci-llvm=.*\\/--set=llvm.download-ci-llvm=false \\/' feeds/packages/lang/rust/Makefile
-# 添加 --set=llvm.build=true 到其下一行
+# ✅ 2. 在其下一行添加 --set=llvm.build=true
 sed -i '/--set=llvm\.download-ci-llvm=false \\/a \ \ \ \ --set=llvm.build=true \\' feeds/packages/lang/rust/Makefile
-# 删除已废弃且报错的 bootstrap-cache-path
+# ✅ 3. 删除 legacy 的 --set=build.bootstrap-cache-path 行（此字段已被 Rust 移除）
 sed -i '/--set=build\.bootstrap-cache-path=/d' feeds/packages/lang/rust/Makefile
-
+# ✅ 4. 删除 configure.py 不认识的 --bootstrap-cache-path 参数（这是根本报错源头）
+sed -i '/--bootstrap-cache-path=/d' feeds/packages/lang/rust/Makefile

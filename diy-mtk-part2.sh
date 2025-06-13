@@ -12,3 +12,9 @@
 
 # 替换默认IP
 sed -i 's#192.168.1.1#192.168.0.1#g' package/base-files/files/bin/config_generate
+
+# 调整rust版本避免编译失败
+git clone https://github.com/coolsnowwolf/packages.git
+rm -rf feeds/packages/lang/rust
+cp -r packages/lang/rust feeds/packages/lang
+rm -rf packages

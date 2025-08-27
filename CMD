@@ -11,4 +11,9 @@ echo "src-git PWluci https://github.com/xiaorouji/openwrt-passwall.git" >> "feed
 
 sed -i 's#192.168.1.1#192.168.0.1#g' package/base-files/files/bin/config_generate
 
+git clone https://github.com/coolsnowwolf/packages.git
+rm -rf feeds/packages/lang/rust
+cp -r packages/lang/rust feeds/packages/lang
+rm -rf packages
+
 make menuconfig

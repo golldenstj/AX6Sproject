@@ -65,3 +65,10 @@ else
   echo "[diy-part2] 未找到 ${BOOST_MK} 文件（feeds 可能还未 update/install），跳过 BOOST 补丁。"
 fi
 echo "[diy-part2] BOOST 补丁处理完成。"
+
+# 修改gn为可编译版本
+rm -rf feeds/packages/devel/gn
+wget https://github.com/immortalwrt/packages/archive/a22edf48a23edfcfe212d2dbb83830d69dbb5f2f.zip -O immortalwrtPackages.zip
+unzip immortalwrtPackages.zip
+cp -r packages-a22edf48a23edfcfe212d2dbb83830d69dbb5f2f/devel/gn feeds/packages/devel/
+rm -rf immortalwrtPackages.zip packages-a22edf48a23edfcfe212d2dbb83830d69dbb5f2f

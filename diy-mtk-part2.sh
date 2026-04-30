@@ -73,17 +73,42 @@ unzip immortalwrtPackages.zip
 cp -r packages-a22edf48a23edfcfe212d2dbb83830d69dbb5f2f/devel/gn feeds/packages/devel/
 rm -rf immortalwrtPackages.zip packages-a22edf48a23edfcfe212d2dbb83830d69dbb5f2f
 
-# 加 noweb 标签规避v0.67之后的变动
-grep -q 'GO_PKG_TAGS:=noweb' feeds/packages/net/frp/Makefile || \
-sed -i '/GO_PKG_BUILD_PKG:=github.com\/fatedier\/frp\/cmd\/\.\.\./a GO_PKG_TAGS:=noweb' feeds/packages/net/frp/Makefile
+# 修复 frp 0.68.1 编译，跳过 Web UI
+FRP_MAKEFILE="feeds/packages/net/frp/Makefile"
 
-grep -q 'web/frpc/dist' feeds/packages/net/frp/Makefile || cat >> feeds/packages/net/frp/Makefile <<'EOF'
+cp "$FRP_MAKEFILE" "${FRP_MAKEFILE}.bak"
 
-define Build/Prepare
-	$(call Build/Prepare/Default)
-	mkdir -p $(PKG_BUILD_DIR)/web/frpc/dist
-	mkdir -p $(PKG_BUILD_DIR)/web/frps/dist
-	touch $(PKG_BUILD_DIR)/web/frpc/dist/.keep
-	touch $(PKG_BUILD_DIR)/web/frps/dist/.keep
-endef
-EOF
+sed -i 's/^PKG_VERSION:=.*/PKG_VERSION:=0.68.1/' "$FRP_MAKEFILE"
+sed -i 's/^PKG_HASH:=.*/PKG_HASH:=44ed7107bf35e4f68dc0e77cd5805102effa5301528b89ee5ab0ab379088edc6/' "$FRP_MAKEFILE"
+sed -i 's/^PKG_BUILD_DEPENDS:=golang\/host node\/host/PKG_BUILD_DEPENDS:=golang\/host/' "$FRP_MAKEFILE"
+
+grep -q '^GO_PKG_TAGS:=noweb' "$FRP_MAKEFILE" || \
+sed -i '/^GO_PKG_BUILD_PKG:=github.com\/fatedier\/frp\/cmd\/\.\.\./a GO_PKG_TAGS:=noweb' "$FRP_MAKEFILE"
+
+python3 - <<'PY'
+from pathlib import Path
+import re
+
+p = Path("feeds/packages/net/frp/Makefile")
+s = p.read_text()
+
+new_block = """define Build/Compile
+\t$(call GoPackage/Build/Compile)
+endef"""
+
+s2, count = re.subn(
+    r"define Build/Compile\n.*?\nendef",
+    new_block,
+    s,
+    count=1,
+    flags=re.S,
+)
+
+if count != 1:
+    raise SystemExit("failed to replace Build/Compile")
+
+p.write_text(s2)
+PY
+
+rm -rf build_dir/target-*/frp-*
+rm -rf dl/frp-0.68.1.tar.gz

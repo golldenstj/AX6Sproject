@@ -72,3 +72,18 @@ wget https://github.com/immortalwrt/packages/archive/a22edf48a23edfcfe212d2dbb83
 unzip immortalwrtPackages.zip
 cp -r packages-a22edf48a23edfcfe212d2dbb83830d69dbb5f2f/devel/gn feeds/packages/devel/
 rm -rf immortalwrtPackages.zip packages-a22edf48a23edfcfe212d2dbb83830d69dbb5f2f
+
+# 加 noweb 标签规避v0.67之后的变动
+grep -q 'GO_PKG_TAGS:=noweb' feeds/packages/net/frp/Makefile || \
+sed -i '/GO_PKG_BUILD_PKG:=github.com\/fatedier\/frp\/cmd\/\.\.\./a GO_PKG_TAGS:=noweb' feeds/packages/net/frp/Makefile
+
+grep -q 'web/frpc/dist' feeds/packages/net/frp/Makefile || cat >> feeds/packages/net/frp/Makefile <<'EOF'
+
+define Build/Prepare
+	$(call Build/Prepare/Default)
+	mkdir -p $(PKG_BUILD_DIR)/web/frpc/dist
+	mkdir -p $(PKG_BUILD_DIR)/web/frps/dist
+	touch $(PKG_BUILD_DIR)/web/frpc/dist/.keep
+	touch $(PKG_BUILD_DIR)/web/frps/dist/.keep
+endef
+EOF

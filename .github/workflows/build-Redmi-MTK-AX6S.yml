@@ -1,13 +1,7 @@
-#
-# Copyright (c) 2019-2020 P3TERX <https://p3terx.com>
-#
-# This is free software, licensed under the MIT License.
-# See /LICENSE for more information.
-#
-# https://github.com/P3TERX/Actions-OpenWrt
-# Description: Build OpenWrt using GitHub Actions
-#
 
+# Redmi AX6S OpenWrt 自动构建。
+# NaiveProxy、Xray 使用官方最新正式版预编译程序，保持原软件包与 LuCI 集成。
+# 其他固件组件依旧从 ImmortalWrt master 源码构建。
 name: Build Redmi-MTK-AX6S OpenWrt
 
 on:
@@ -15,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       ssh:
-        description: 'SSH connection to Actions'
+        description: '是否通过 SSH 进入 Actions 调试'
         required: false
         default: 'false'
 
@@ -33,217 +27,229 @@ env:
   UPLOAD_RELEASE: true
   TZ: Asia/Shanghai
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-22.04
+    timeout-minutes: 360
 
     steps:
-    - name: Before freeing up disk space
-      run: |
-        echo "Before freeing up disk space"
-        echo "=============================================================================="
-        df -hT
-        echo "=============================================================================="
+      # 保留原有磁盘清理方式，避免大体积工具链占满 Runner。
+      - name: Before freeing up disk space
+        run: df -hT
 
-    - name: "Optimize Disk Space"
-      uses: "hugoalh/disk-space-optimizer-ghaction@v0.8.1"
-      with:
-        operate_sudo: "True"
-        general_include: ".+"
-        general_exclude: |-
-          ^GCC$
-          ^G\+\+$
-          Clang
-          LLVM
-        docker_include: ".+"
-        docker_prune: "True"
-        docker_clean: "True"
-        apt_prune: "True"
-        apt_clean: "True"
-        homebrew_prune: "True"
-        homebrew_clean: "True"
-        npm_prune: "True"
-        npm_clean: "True"
-        os_swap: "True"
+      - name: Optimize Disk Space
+        uses: hugoalh/disk-space-optimizer-ghaction@v0.8.1
+        with:
+          operate_sudo: 'True'
+          general_include: '.+'
+          general_exclude: |-
+            ^GCC$
+            ^G\+\+$
+            Clang
+            LLVM
+          docker_include: '.+'
+          docker_prune: 'True'
+          docker_clean: 'True'
+          apt_prune: 'True'
+          apt_clean: 'True'
+          homebrew_prune: 'True'
+          homebrew_clean: 'True'
+          npm_prune: 'True'
+          npm_clean: 'True'
+          os_swap: 'True'
 
-    - name: Freeing up disk space
-      uses: wekingchen/maximize-build-space@master
-      with: 
-        root-reserve-mb: 2048
-        swap-size-mb: 1
-        remove-dotnet: 'true'
-        remove-android: 'true'
-        remove-haskell: 'true'
-        remove-codeql: 'true'
-        remove-docker-images: 'true'
+      - name: Freeing up disk space
+        uses: wekingchen/maximize-build-space@master
+        with:
+          root-reserve-mb: 2048
+          swap-size-mb: 1
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
 
-    - name: Free up disk space complete
-      run: |
-        echo "Free up disk space complete"
-        echo "=============================================================================="
-        df -hT
-        echo "=============================================================================="
+      - name: Free up disk space complete
+        run: df -hT
 
-    - name: Checkout
-      uses: actions/checkout@main
+      - name: Checkout
+        uses: actions/checkout@main
 
-    - name: Initialization environment
-      env:
-        DEBIAN_FRONTEND: noninteractive
-      run: |
-        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
-        sudo -E apt-get -qq update
-        sudo -E apt-get -qq install $(curl -fsSL raw.githubusercontent.com/wekingchen/my-file/master/depends-ubuntuLTS)
-        sudo -E apt-get -qq autoremove --purge
-        sudo -E apt-get -qq remove subversion
-        sudo -E apt-get -qq install subversion
-        sudo -E apt-get -qq install -y gcc-12 g++-12
-        sudo -E apt-get -qq clean
-        sudo timedatectl set-timezone "$TZ"
-        sudo chown $USER:$GROUPS $GITHUB_WORKSPACE
+      # 移除只供旧 GN 验证使用的 GCC 12 专项安装及 GN 编译步骤。
+      # 若其他组件需要 GCC/Go，OpenWrt 仍会按依赖正常准备。
+      - name: Initialization environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq install $(curl -fsSL raw.githubusercontent.com/wekingchen/my-file/master/depends-ubuntuLTS)
+          sudo -E apt-get -qq autoremove --purge
+          sudo -E apt-get -qq remove subversion
+          sudo -E apt-get -qq install subversion
+          sudo -E apt-get -qq clean
+          sudo timedatectl set-timezone "$TZ"
+          sudo chown "$USER:$GROUPS" "$GITHUB_WORKSPACE"
 
-    - name: Clone source code
-      working-directory: ./
-      run: |
-        df -hT $PWD
-        git clone $REPO_URL -b $REPO_BRANCH openwrt
-        ln -sf /openwrt $GITHUB_WORKSPACE/openwrt
+      - name: Clone source code
+        run: |
+          df -hT "$PWD"
+          git clone --single-branch -b "$REPO_BRANCH" "$REPO_URL" openwrt
 
-    - name: Load custom feeds
-      run: |
-        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
-        chmod +x $DIY_P1_SH
-        cd openwrt
-        $GITHUB_WORKSPACE/$DIY_P1_SH
+      - name: Load custom feeds
+        run: |
+          [ ! -e "$FEEDS_CONF" ] || mv "$FEEDS_CONF" openwrt/feeds.conf.default
+          chmod +x "$DIY_P1_SH"
+          cd openwrt
+          "$GITHUB_WORKSPACE/$DIY_P1_SH"
 
-    - name: Update feeds
-      run: cd openwrt && ./scripts/feeds update -a
+      - name: Update feeds
+        run: cd openwrt && ./scripts/feeds update -a
 
-    - name: Install feeds
-      run: cd openwrt && ./scripts/feeds install -a
+      - name: Install feeds
+        run: cd openwrt && ./scripts/feeds install -a
 
-    - name: Load custom configuration
-      run: |
-        [ -e files ] && mv files openwrt/files
-        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
-        chmod +x $DIY_P2_SH
-        cd openwrt
-        $GITHUB_WORKSPACE/$DIY_P2_SH
+      # 下载最新正式版预编译资产、核验 SHA256 和 ARM64 ELF，生成本地 OpenWrt 包规则。
+      # GitHub 令牌仅用于查询公开 Release 接口，不传到固件，也不用于文件直链下载。
+      - name: Load custom configuration and prebuilt binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [ ! -e files ] || mv files openwrt/files
+          [ ! -e "$CONFIG_FILE" ] || mv "$CONFIG_FILE" openwrt/.config
+          chmod +x "$DIY_P2_SH"
+          cd openwrt
+          "$GITHUB_WORKSPACE/$DIY_P2_SH"
+          test -s ax6s-prebuilt-versions.txt
+          test -s feeds/packages/net/naiveproxy/files/ax6s-prebuilt/naive
+          test -s feeds/packages/net/xray-core/files/ax6s-prebuilt/xray
+          cat ax6s-prebuilt-versions.txt
 
-    - name: SSH connection to Actions
-      uses: P3TERX/ssh2actions@v1.0.0
-      if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh  != 'false') || contains(github.event.action, 'ssh')
-      env:
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-    
-    - name: Download package
-      id: package
-      run: |
-        cd openwrt
-        make defconfig
-        make download -j8
-        find dl -size -1024c -exec ls -l {} \;
-        find dl -size -1024c -exec rm -f {} \;
+      - name: SSH connection to Actions
+        uses: P3TERX/ssh2actions@v1.0.0
+        if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh != 'false') || contains(github.event.action, 'ssh')
+        env:
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
 
-    - name: Verify GN host build
-      run: |
-        cd openwrt
-        echo "Checking GCC 12 C++23 support"
-        g++-12 --version
-        printf 'int main() { return 0; }\n' | \
-          g++-12 -std=c++23 -x c++ -fsyntax-only -
+      # 官方二进制已在上一阶段下载，无需预编译 GN 或 Go 版本的 Xray。
+      # 其他软件包仍沿用原来的下载流程。
+      - name: Download package
+        id: package
+        run: |
+          cd openwrt
+          make defconfig
+          make download -j8
+          find dl -type f -size -1024c -print -delete
 
-        make -j"$(nproc)" tools/install V=sc
-        make -j1 package/feeds/packages/gn/host/compile V=sc
-        
-    - name: Compile the firmware
-      id: compile
-      run: |
-        cd openwrt
-        echo -e "$(nproc) thread compile"
-        make -j$(nproc) V=sc || make -j1 V=sc
-        echo "status=success" >> $GITHUB_OUTPUT
-        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
-        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
-        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
-    
-    - name: Check space usage
-      if: (!cancelled())
-      run: df -hT
+      # 提前留存来源与版本，后续其他软件包编译失败时仍可审计。
+      - name: Upload prebuilt version manifest
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: AX6S-official-prebuilt-versions
+          path: openwrt/ax6s-prebuilt-versions.txt
+          if-no-files-found: ignore
 
-    - name: Upload bin directory
-      uses: actions/upload-artifact@main
-      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
-      with:
-        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: openwrt/bin
+      # 编译失败后再用单线程详细日志复现，优先暴露最初错误。
+      - name: Compile the firmware
+        id: compile
+        run: |
+          cd openwrt
+          echo "$(nproc) 线程编译"
+          make -j"$(nproc)" V=sc || make -j1 V=sc
+          echo 'status=success' >> "$GITHUB_OUTPUT"
+          grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+          [ ! -s DEVICE_NAME ] || echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> "$GITHUB_ENV"
+          echo "FILE_DATE=_$(date +%Y%m%d%H%M)" >> "$GITHUB_ENV"
 
-    - name: Organize files
-      id: organize
-      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
-      run: |
-        cd openwrt/bin/targets/*/*
-        rm -rf packages
-        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
-        echo "status=success" >> $GITHUB_OUTPUT
+      - name: Check space usage
+        if: ${{ !cancelled() }}
+        run: df -hT
 
-    - name: Upload firmware directory
-      uses: actions/upload-artifact@main
-      if: steps.organize.outputs.status == 'success' && !cancelled()
-      with:
-        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: ${{ env.FIRMWARE }}
+      - name: Upload bin directory
+        uses: actions/upload-artifact@v4
+        if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+        with:
+          name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+          path: openwrt/bin
 
-    - name: Upload firmware to cowtransfer
-      id: cowtransfer
-      if: steps.organize.outputs.status == 'success' && env.UPLOAD_COWTRANSFER == 'true' && !cancelled()
-      run: |
-        curl -fsSL git.io/file-transfer | sh
-        ./transfer cow --block 2621440 -s -p 64 --no-progress ${FIRMWARE} 2>&1 | tee cowtransfer.log
-        echo "::warning file=cowtransfer.com::$(cat cowtransfer.log | grep https)"
-        echo "url=$(cat cowtransfer.log | grep https | cut -f3 -d" ")" >> $GITHUB_OUTPUT
+      - name: Organize files
+        id: organize
+        if: steps.compile.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true'
+        run: |
+          cd openwrt/bin/targets/*/*
+          rm -rf packages
+          echo "FIRMWARE=$PWD" >> "$GITHUB_ENV"
+          echo 'status=success' >> "$GITHUB_OUTPUT"
 
-    - name: Upload firmware to WeTransfer
-      id: wetransfer
-      if: steps.organize.outputs.status == 'success' && env.UPLOAD_WETRANSFER == 'true' && !cancelled()
-      run: |
-        curl -fsSL git.io/file-transfer | sh
-        ./transfer wet -s -p 16 --no-progress ${FIRMWARE} 2>&1 | tee wetransfer.log
-        echo "::warning file=wetransfer.com::$(cat wetransfer.log | grep https)"
-        echo "url=$(cat wetransfer.log | grep https | cut -f3 -d" ")" >> $GITHUB_OUTPUT
+      - name: Upload firmware directory
+        uses: actions/upload-artifact@v4
+        if: steps.organize.outputs.status == 'success'
+        with:
+          name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+          path: ${{ env.FIRMWARE }}
 
-    - name: Generate release tag
-      id: tag
-      if: steps.compile.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true' && !cancelled()
-      run: |
-        echo "release_tag=$(date +"%Y.%m.%d-%H%M")-AX6S-MTK" >> $GITHUB_OUTPUT
-        touch release.txt
-        [ $UPLOAD_COWTRANSFER = true ] && echo "🔗 [Cowtransfer](${{ steps.cowtransfer.outputs.url }})" >> release.txt
-        [ $UPLOAD_WETRANSFER = true ] && echo "🔗 [WeTransfer](${{ steps.wetransfer.outputs.url }})" >> release.txt
-        echo "status=success" >> $GITHUB_OUTPUT
+      - name: Upload firmware to cowtransfer
+        id: cowtransfer
+        if: steps.organize.outputs.status == 'success' && env.UPLOAD_COWTRANSFER == 'true'
+        run: |
+          curl -fsSL git.io/file-transfer | sh
+          ./transfer cow --block 2621440 -s -p 64 --no-progress "${FIRMWARE}" 2>&1 | tee cowtransfer.log
+          echo "url=$(grep https cowtransfer.log | cut -f3 -d' ')" >> "$GITHUB_OUTPUT"
 
-    - name: Upload firmware to release
-      uses: softprops/action-gh-release@v1
-      if: steps.compile.outputs.status == 'success' && steps.tag.outputs.status == 'success' && !cancelled()
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ steps.tag.outputs.release_tag }}
-        body_path: release.txt
-        files: /home/runner/work/AX6Sproject/AX6Sproject/openwrt/bin/targets/mediatek/mt7622/immortalwrt-*squashfs*
+      - name: Upload firmware to WeTransfer
+        id: wetransfer
+        if: steps.organize.outputs.status == 'success' && env.UPLOAD_WETRANSFER == 'true'
+        run: |
+          curl -fsSL git.io/file-transfer | sh
+          ./transfer wet -s -p 16 --no-progress "${FIRMWARE}" 2>&1 | tee wetransfer.log
+          echo "url=$(grep https wetransfer.log | cut -f3 -d' ')" >> "$GITHUB_OUTPUT"
 
-    - name: Delete workflow runs
-      uses: wekingchen/delete-workflow-runs@main
-      with:
-        retain_days: 1
-        keep_minimum_runs: 10
+      # 必须确认编译成功且固件文件存在，避免创建空 Release。
+      - name: Generate release tag
+        id: tag
+        if: steps.compile.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true'
+        run: |
+          shopt -s nullglob
+          images=(openwrt/bin/targets/mediatek/mt7622/immortalwrt-*squashfs*)
+          ((${#images[@]} > 0)) || { echo '没有找到 squashfs 固件，停止发布' >&2; exit 1; }
+          echo "release_tag=$(date +%Y.%m.%d-%H%M)-AX6S-MTK" >> "$GITHUB_OUTPUT"
+          cp openwrt/ax6s-prebuilt-versions.txt release.txt
+          if [ "$UPLOAD_COWTRANSFER" = true ]; then
+            echo "Cowtransfer: ${{ steps.cowtransfer.outputs.url }}" >> release.txt
+          fi
+          if [ "$UPLOAD_WETRANSFER" = true ]; then
+            echo "WeTransfer: ${{ steps.wetransfer.outputs.url }}" >> release.txt
+          fi
+          echo 'status=success' >> "$GITHUB_OUTPUT"
 
-    - name: Remove old Releases
-      uses: dev-drprasad/delete-older-releases@v0.3.4
-      if: steps.compile.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true' && !cancelled()
-      with:
-        keep_latest: 8
-        delete_tags: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload firmware to release
+        uses: softprops/action-gh-release@v2
+        if: steps.tag.outputs.status == 'success'
+        with:
+          tag_name: ${{ steps.tag.outputs.release_tag }}
+          body_path: release.txt
+          fail_on_unmatched_files: true
+          files: |
+            openwrt/bin/targets/mediatek/mt7622/immortalwrt-*squashfs*
+            openwrt/ax6s-prebuilt-versions.txt
+
+      - name: Delete workflow runs
+        uses: wekingchen/delete-workflow-runs@main
+        if: steps.compile.outputs.status == 'success'
+        with:
+          retain_days: 1
+          keep_minimum_runs: 10
+
+      - name: Remove old Releases
+        uses: dev-drprasad/delete-older-releases@v0.3.4
+        if: steps.tag.outputs.status == 'success'
+        with:
+          keep_latest: 8
+          delete_tags: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -19,34 +19,11 @@ rm -rf feeds/packages/lang/rust
 cp -a packages/lang/rust feeds/packages/lang/rust
 rm -rf packages
 
-# 三、保留 Boost system/filesystem 依赖修复，避免重复插入。
-echo '[diy-part2] 检查 Boost 依赖...'
-python3 - <<'PY'
-from pathlib import Path
-import re
-
-p = Path('feeds/packages/libs/boost/Makefile')
-if not p.is_file():
-    print('[diy-part2] 未找到 Boost Makefile，跳过')
-else:
-    s = p.read_text()
-    if 'DefineBoostLibrary,system' not in s:
-        marker = '$(eval $(call DefineBoostLibrary,date_time))'
-        if marker not in s:
-            raise SystemExit('[diy-part2] 无法确认 Boost system 插入位置')
-        s = s.replace(marker, marker + '\n$(eval $(call DefineBoostLibrary,system))', 1)
-    pattern = r'(\$\(eval \$\(call DefineBoostLibrary,filesystem,)([^)]*)(\)\))'
-    def add_system(m):
-        libs = m.group(2).split()
-        if 'system' not in libs:
-            libs.append('system')
-        return m.group(1) + ' '.join(libs) + m.group(3)
-    s, count = re.subn(pattern, add_system, s, count=1)
-    if count != 1:
-        raise SystemExit('[diy-part2] 无法确认 Boost filesystem 依赖定义')
-    p.write_text(s)
-    print('[diy-part2] Boost 修复完成')
-PY
+# 三、Boost 兼容性检查
+# 当前 ImmortalWrt 使用 Boost 1.92，Boost.System 已不需要独立编译库。
+# 不再人为创建 boost-system 软件包，也不修改 filesystem 的上游依赖。
+# 保留上游原生 Makefile，避免旧补丁引入无效依赖。
+echo '[diy-part2] Boost 使用 ImmortalWrt 上游原生配置，跳过旧版兼容补丁。'
 
 # 四、保留 FRP 0.68.1 的现有兼容方案，跳过 Web UI 编译。
 echo '[diy-part2] 处理 FRP 兼容性...'

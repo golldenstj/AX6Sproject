@@ -435,10 +435,35 @@ $(eval $(call BuildPackage,sing-box))
 (sing_pkg / 'Makefile').write_text(sing_make)
 
 # 显式关闭历史源码包，避免 .config 持续强制选择 libcronet。
-import subprocess
-subprocess.run(['./scripts/config', '--disable', 'PACKAGE_libcronet',
-                '--disable', 'SING_BOX_BUILD_NAIVE_OUTBOUND',
-                '--disable', 'SING_BOX_TINY_BUILD_NAIVE_OUTBOUND'], check=True)
+# 修改原始配置，防止旧版源码依赖重新进入构建。
+# 不调用 scripts/config，因为它在 ImmortalWrt 中是目录。
+# make defconfig 将在后续工作流中重新解析依赖关系。
+
+disabled = (
+    'PACKAGE_libcronet',
+    'SING_BOX_BUILD_NAIVE_OUTBOUND',
+    'SING_BOX_TINY_BUILD_NAIVE_OUTBOUND',
+)
+
+config_path = ROOT / '.config'
+if not config_path.is_file():
+    raise RuntimeError('找不到 OpenWrt .config，无法清理旧依赖')
+
+config_lines = config_path.read_text().splitlines()
+for symbol in disabled:
+    pattern = re.compile(
+        r'^(?:# )?CONFIG_' + re.escape(symbol) +
+        r'(?:=.*| is not set)$'
+    )
+    config_lines = [
+        line for line in config_lines
+        if not pattern.fullmatch(line)
+    ]
+    config_lines.append(f'# CONFIG_{symbol} is not set')
+
+config_path.write_text('\n'.join(config_lines) + '\n')
+print('[diy-part2] 已禁用本地 libcronet 和 Sing-box 源码 Naive 构建选项')
+
 
 manifest = ROOT / 'ax6s-prebuilt-versions.txt'
 manifest.write_text(

@@ -465,7 +465,8 @@ jobs:
         run: |
           shopt -s nullglob
 
-          images=(openwrt/bin/targets/mediatek/mt7622/immortalwrt-*squashfs*)
+          dir=openwrt/bin/targets/mediatek/mt7622
+          images=("$dir"/immortalwrt-*squashfs* "$dir"/immortalwrt-*-factory.bin)
 
           ((${#images[@]} > 0)) || {
             echo '没有找到 squashfs 固件，停止发布' >&2
@@ -496,6 +497,8 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             openwrt/bin/targets/mediatek/mt7622/immortalwrt-*squashfs*
+            openwrt/bin/targets/mediatek/mt7622/immortalwrt-*-factory.bin
+            openwrt/bin/targets/mediatek/mt7622/sha256sums
             openwrt/ax6s-prebuilt-versions.txt
 
       # 仅在成功编译后清理旧的工作流运行记录。

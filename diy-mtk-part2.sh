@@ -1,15 +1,15 @@
 
 #!/bin/bash
 # Redmi AX6S 自定义配置：在 Feeds 安装之后、make defconfig 之前执行。
-# 仅针对本机固件调整，保留 Rust、Boost、FRP 和 Firewall4 的兼容处理。
-# NaiveProxy 与 Xray 改为官方稳定版预编译文件，仍由 OpenWrt 生成标准软件包。
+# 保留 Rust、Boost、FRP、Firewall4 的既有兼容方案。
+# NaiveProxy、Xray 与 Sing-box 改用官方正式版 ARM64 预编译文件；保持 OpenWrt 软件包及服务集成。
 set -Eeuo pipefail
 trap 'echo "[diy-part2] 第 ${LINENO} 行执行失败，请检查上方日志" >&2' ERR
 
 # 一、修改默认 LAN 地址。
 sed -i 's#192.168.1.1#192.168.0.1#g' package/base-files/files/bin/config_generate
 
-# 二、保留既有 Rust 兼容方案；只临时获取需要的 Rust 软件包目录。
+# 二、保留既有 Rust 兼容方案。
 echo '[diy-part2] 准备 Rust 兼容软件包...'
 if [ ! -d packages/lang/rust ]; then
   git clone --depth=1 https://github.com/coolsnowwolf/packages.git packages
@@ -19,13 +19,10 @@ rm -rf feeds/packages/lang/rust
 cp -a packages/lang/rust feeds/packages/lang/rust
 rm -rf packages
 
-# 三、Boost 兼容性检查
-# 当前 ImmortalWrt 使用 Boost 1.92，Boost.System 已不需要独立编译库。
-# 不再人为创建 boost-system 软件包，也不修改 filesystem 的上游依赖。
-# 保留上游原生 Makefile，避免旧补丁引入无效依赖。
+# 三、Boost 兼容性检查。
 echo '[diy-part2] Boost 使用 ImmortalWrt 上游原生配置，跳过旧版兼容补丁。'
 
-# 四、保留 FRP 0.68.1 的现有兼容方案，跳过 Web UI 编译。
+# 四、保留 FRP 0.68.1 的既有兼容方案，跳过 Web UI 编译。
 echo '[diy-part2] 处理 FRP 兼容性...'
 FRP_MAKEFILE='feeds/packages/net/frp/Makefile'
 test -f "$FRP_MAKEFILE"
@@ -50,7 +47,6 @@ rm -rf build_dir/target-*/frp-*
 rm -f dl/frp-0.68.1.tar.gz
 
 # 五、适配 ImmortalWrt 新版 Firewall4 的 FullCone NAT 默认配置补丁。
-# 只修正已验证失效的第一段，不删除 FullCone 的其他实现。
 echo '[diy-part2] 适配 Firewall4 FullCone NAT 补丁...'
 python3 - <<'PY'
 from pathlib import Path
@@ -90,10 +86,9 @@ if old != new:
 print('[diy-part2] FullCone 第一段补丁已适配')
 PY
 
-# 六、自动获取官方最新正式版，校验发布资产的 SHA256 和 ARM64 ELF 格式。
-# 不使用第三方二进制，也不允许下载失败时静默回退到旧版本。
-# 原始 Feeds 软件包名称、配置文件和服务脚本仍然保留。
-echo '[diy-part2] 获取 NaiveProxy 和 Xray 官方预编译文件...'
+# 六、官方二进制构建：只接受正式版、校验 Release SHA256、AArch64 与静态链接。
+# 注意 Sing-box 必须选择 linux-arm64-musl；普通 arm64 版需要附带 libcronet.so。
+echo '[diy-part2] 获取 NaiveProxy、Xray 和 Sing-box 官方预编译文件...'
 python3 - <<'PY'
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -109,10 +104,10 @@ import time
 import zipfile
 
 ROOT = Path.cwd()
-AGENT = 'AX6S-OpenWrt-prebuilt/1.0'
+AGENT = 'AX6S-OpenWrt-prebuilt/2.0'
 TOKEN = os.environ.get('GH_TOKEN', '')
 
-# 下载仅允许 GitHub 官方 Release；接口访问可使用工作流令牌提高限额。
+# 下载只允许 HTTPS；查询 API 可以使用工作流令牌以避免匿名限额。
 def download(url, api=False):
     if not url.startswith('https://'):
         raise RuntimeError('拒绝非 HTTPS 下载地址')
@@ -128,7 +123,7 @@ def download(url, api=False):
                 raise RuntimeError(f'下载失败：{url}：{exc}') from exc
             time.sleep(2 * (attempt + 1))
 
-# 只接受最新正式版；如果官方没有目标架构资产就停止构建。
+# 最新正式版须有唯一的目标架构资产和 GitHub 发布元数据 SHA256。
 def get_release(repo, name_fn):
     meta = json.loads(download(f'https://api.github.com/repos/{repo}/releases/latest', api=True))
     tag = meta.get('tag_name', '')
@@ -151,22 +146,22 @@ def get_release(repo, name_fn):
         raise RuntimeError(f'{asset_name} SHA256 校验失败')
     return tag[1:], blob, digest
 
-# 只从官方归档中读取所需文件，不执行压缩包内脚本。
-def from_tar(data, basename):
-    with tarfile.open(fileobj=io.BytesIO(data), mode='r:xz') as tf:
+# 只从受信的官方归档内提取唯一的目标文件；不执行归档内脚本。
+def from_tar(data, basename, mode='r:xz'):
+    with tarfile.open(fileobj=io.BytesIO(data), mode=mode) as tf:
         matches = [m for m in tf.getmembers() if m.isfile() and Path(m.name).name == basename]
         if len(matches) != 1:
-            raise RuntimeError(f'NaiveProxy 归档内 {basename} 数量异常')
+            raise RuntimeError(f'官方归档内 {basename} 数量异常：{len(matches)}')
         return tf.extractfile(matches[0]).read()
 
 def from_zip(data, basename):
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         names = [n for n in zf.namelist() if not n.endswith('/') and Path(n).name == basename]
         if len(names) != 1:
-            raise RuntimeError(f'Xray 归档内 {basename} 数量异常')
+            raise RuntimeError(f'官方归档内 {basename} 数量异常：{len(names)}')
         return zf.read(names[0])
 
-# 校验 64 位小端 AArch64；静态文件不能携带 ELF 解释器。
+# ARM64 小端静态 ELF：禁止 PT_INTERP（动态加载器）。
 def check_elf(name, data):
     if len(data) < 64 or data[:6] != b'\x7fELF\x02\x01':
         raise RuntimeError(f'{name} 不是 64 位小端 ELF 文件')
@@ -174,49 +169,78 @@ def check_elf(name, data):
         raise RuntimeError(f'{name} 不是 AArch64 架构')
     phoff = struct.unpack_from('<Q', data, 32)[0]
     phentsize, phnum = struct.unpack_from('<HH', data, 54)
-    if phoff + phentsize * phnum > len(data) or phentsize < 4:
+    if phentsize < 56 or phoff + phentsize * phnum > len(data):
         raise RuntimeError(f'{name} ELF 程序头异常')
     for i in range(phnum):
-        if struct.unpack_from('<I', data, phoff + phentsize * i)[0] == 3:
-            raise RuntimeError(f'{name} 含动态加载器，不能当作静态可执行文件')
+        header = phoff + phentsize * i
+        ptype = struct.unpack_from('<I', data, header)[0]
+        if ptype == 3:  # 动态加载器程序头
+            raise RuntimeError(f'{name} 存在动态加载器，拒绝将其封装为静态程序')
+        if ptype == 2:  # 动态段：进一步检查是否依赖其它共享库。
+            doff = struct.unpack_from('<Q', data, header + 8)[0]
+            dsize = struct.unpack_from('<Q', data, header + 32)[0]
+            if doff + dsize > len(data):
+                raise RuntimeError(f'{name} ELF 动态段越界')
+            for offset in range(doff, doff + dsize - 15, 16):
+                dtag = struct.unpack_from('<q', data, offset)[0]
+                if dtag == 1:  # 共享库依赖项
+                    raise RuntimeError(f'{name} 仍需要共享库，拒绝静态封装')
+                if dtag == 0:
+                    break
 
 naive_version, naive_archive, naive_digest = get_release(
-    'klzgrad/naiveproxy',
-    lambda tag: f'naiveproxy-{tag}-openwrt-aarch64_cortex-a53-static.tar.xz'
+    'klzgrad/naiveproxy', lambda tag: f'naiveproxy-{tag}-openwrt-aarch64_cortex-a53-static.tar.xz'
 )
 xray_version, xray_archive, xray_digest = get_release(
     'XTLS/Xray-core', lambda tag: 'Xray-linux-arm64-v8a.zip'
 )
+sing_version, sing_archive, sing_digest = get_release(
+    'SagerNet/sing-box', lambda tag: f'sing-box-{tag[1:]}-linux-arm64-musl.tar.gz'
+)
 naive_bin = from_tar(naive_archive, 'naive')
 xray_bin = from_zip(xray_archive, 'xray')
-check_elf('NaiveProxy', naive_bin)
-check_elf('Xray', xray_bin)
+sing_bin = from_tar(sing_archive, 'sing-box', mode='r:gz')
+for name, binary in [('NaiveProxy', naive_bin), ('Xray', xray_bin), ('Sing-box', sing_bin)]:
+    check_elf(name, binary)
 
 naive_pkg = ROOT / 'feeds/packages/net/naiveproxy'
 xray_pkg = ROOT / 'feeds/packages/net/xray-core'
-for path in (naive_pkg / 'files/naiveproxy.init', naive_pkg / 'files/naiveproxy.config',
-             xray_pkg / 'files/xray.init', xray_pkg / 'files/xray.conf',
-             xray_pkg / 'files/config.json.example'):
+sing_pkg = ROOT / 'feeds/packages/net/sing-box'
+for path in (
+    naive_pkg / 'files/naiveproxy.init', naive_pkg / 'files/naiveproxy.config',
+    xray_pkg / 'files/xray.init', xray_pkg / 'files/xray.conf',
+    xray_pkg / 'files/config.json.example',
+    sing_pkg / 'files/sing-box.init', sing_pkg / 'files/sing-box.conf',
+):
     if not path.is_file():
         raise RuntimeError(f'官方预编译封装所需文件不存在：{path}')
 
-# 保留对应授权文件，避免因不再下载源代码而丢失许可证。
+# 保留许可文件，Sing-box 示例配置取同一官方 Release tag 的源码。
 naive_license = from_tar(naive_archive, 'LICENSE')
 xray_license = from_zip(xray_archive, 'LICENSE')
+try:
+    sing_license = from_tar(sing_archive, 'LICENSE', mode='r:gz')
+except RuntimeError:
+    sing_license = download(f'https://raw.githubusercontent.com/SagerNet/sing-box/v{sing_version}/LICENSE')
+sing_example = download(f'https://raw.githubusercontent.com/SagerNet/sing-box/v{sing_version}/release/config/config.json')
+json.loads(sing_example)  # 预检示例配置是有效 JSON
+
 for pkg, filename, data in (
     (naive_pkg, 'naive', naive_bin), (naive_pkg, 'LICENSE', naive_license),
     (xray_pkg, 'xray', xray_bin), (xray_pkg, 'LICENSE', xray_license),
+    (sing_pkg, 'sing-box', sing_bin), (sing_pkg, 'LICENSE', sing_license),
+    (sing_pkg, 'config.json', sing_example),
 ):
     dest = pkg / 'files/ax6s-prebuilt' / filename
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(data)
-    dest.chmod(0o755 if filename in ('naive', 'xray') else 0o644)
+    dest.chmod(0o755 if filename in ('naive', 'xray', 'sing-box') else 0o644)
 
-# NaiveProxy：只替换软件包的构建阶段，保持原包名和 UCI/init 文件。
+# NaiveProxy：仅改变软件包构建方式，继续保留原包名、UCI 与 init 服务。
 naive_make = r'''include $(TOPDIR)/rules.mk
 
 PKG_NAME:=naiveproxy
-PKG_REAL_VERSION:=@NAIVE_VERSION@
+PKG_REAL_VERSION:=@VERSION@
 PKG_VERSION:=$(subst -,.,$(PKG_REAL_VERSION))
 PKG_RELEASE:=1
 PKG_LICENSE:=BSD-3-Clause
@@ -264,13 +288,13 @@ define Package/naiveproxy/install
 endef
 
 $(eval $(call BuildPackage,naiveproxy))
-'''.replace('@NAIVE_VERSION@', naive_version)
+'''.replace('@VERSION@', naive_version)
 
-# Xray：沿用 xray-core 与 xray-example 的包名和服务文件，不再使用 Go 构建规则。
+# Xray：保持 xray-core 和 xray-example 的既有包名与服务文件。
 xray_make = r'''include $(TOPDIR)/rules.mk
 
 PKG_NAME:=xray-core
-PKG_VERSION:=@XRAY_VERSION@
+PKG_VERSION:=@VERSION@
 PKG_RELEASE:=1
 PKG_LICENSE:=MPL-2.0
 PKG_LICENSE_FILES:=LICENSE
@@ -346,12 +370,76 @@ endef
 
 $(eval $(call BuildPackage,xray-core))
 $(eval $(call BuildPackage,xray-example))
-'''.replace('@XRAY_VERSION@', xray_version)
+'''.replace('@VERSION@', xray_version)
+
+# Sing-box：完整 ARM64 musl 官方静态程序内含 Naive 出站，不需要编译 libcronet 或 GN。
+# 仅封装完整包；当前 AX6S 并未选择 sing-box-tiny。
+sing_make = r'''include $(TOPDIR)/rules.mk
+
+PKG_NAME:=sing-box
+PKG_VERSION:=@VERSION@
+PKG_RELEASE:=1
+PKG_LICENSE:=GPL-3.0-or-later
+PKG_LICENSE_FILES:=LICENSE
+PKG_MAINTAINER:=Tianling Shen <cnsztl@immortalwrt.org>
+PKG_BUILD_DIR:=$(BUILD_DIR)/sing-box-$(PKG_VERSION)
+
+include $(INCLUDE_DIR)/package.mk
+
+define Package/sing-box
+  SECTION:=net
+  CATEGORY:=Network
+  SUBMENU:=Web Servers/Proxies
+  TITLE:=The universal proxy platform (official ARM64 musl)
+  URL:=https://sing-box.sagernet.org/
+  DEPENDS:=+ca-bundle +kmod-inet-diag +kmod-netlink-diag +kmod-tun
+  USERID:=sing-box=5566:sing-box=5566
+endef
+
+define Package/sing-box/description
+  Official ARM64 musl static build with Naive outbound included.
+endef
+
+define Build/Prepare
+	$(INSTALL_DIR) $(PKG_BUILD_DIR)
+	$(INSTALL_BIN) $(CURDIR)/files/ax6s-prebuilt/sing-box $(PKG_BUILD_DIR)/sing-box
+	$(INSTALL_DATA) $(CURDIR)/files/ax6s-prebuilt/LICENSE $(PKG_BUILD_DIR)/LICENSE
+endef
+
+define Build/Configure
+endef
+
+define Build/Compile
+endef
+
+define Package/sing-box/conffiles
+/etc/config/sing-box
+/etc/sing-box/
+endef
+
+define Package/sing-box/install
+	$(INSTALL_DIR) $(1)/usr/bin
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/sing-box $(1)/usr/bin/sing-box
+	$(INSTALL_DIR) $(1)/etc/sing-box
+	$(INSTALL_DATA) $(CURDIR)/files/ax6s-prebuilt/config.json $(1)/etc/sing-box/config.json
+	$(INSTALL_DIR) $(1)/etc/config $(1)/etc/init.d
+	$(INSTALL_CONF) $(CURDIR)/files/sing-box.conf $(1)/etc/config/sing-box
+	$(INSTALL_BIN) $(CURDIR)/files/sing-box.init $(1)/etc/init.d/sing-box
+endef
+
+$(eval $(call BuildPackage,sing-box))
+'''.replace('@VERSION@', sing_version)
 
 (naive_pkg / 'Makefile').write_text(naive_make)
 (xray_pkg / 'Makefile').write_text(xray_make)
+(sing_pkg / 'Makefile').write_text(sing_make)
 
-# 为 Release 和 Actions 记录每次使用的实际版本及官方资产哈希。
+# 显式关闭历史源码包，避免 .config 持续强制选择 libcronet。
+import subprocess
+subprocess.run(['./scripts/config', '--disable', 'PACKAGE_libcronet',
+                '--disable', 'SING_BOX_BUILD_NAIVE_OUTBOUND',
+                '--disable', 'SING_BOX_TINY_BUILD_NAIVE_OUTBOUND'], check=True)
+
 manifest = ROOT / 'ax6s-prebuilt-versions.txt'
 manifest.write_text(
     'AX6S 官方预编译组件\n'
@@ -359,11 +447,14 @@ manifest.write_text(
     f'NaiveProxy 官方归档 SHA256: {naive_digest[7:]}\n'
     f'Xray-core: v{xray_version}\n'
     f'Xray 官方归档 SHA256: {xray_digest[7:]}\n'
+    f'Sing-box: v{sing_version} (linux-arm64-musl; 内置 Naive 出站)\n'
+    f'Sing-box 官方归档 SHA256: {sing_digest[7:]}\n'
     f'NaiveProxy ELF SHA256: {hashlib.sha256(naive_bin).hexdigest()}\n'
     f'Xray ELF SHA256: {hashlib.sha256(xray_bin).hexdigest()}\n'
+    f'Sing-box ELF SHA256: {hashlib.sha256(sing_bin).hexdigest()}\n'
 )
 print(manifest.read_text(), flush=True)
-print('[diy-part2] 官方预编译软件包封装完成', flush=True)
+print('[diy-part2] 三款官方预编译软件包封装完成；已关闭本地 libcronet 选择。', flush=True)
 PY
 
 echo '[diy-part2] 全部自定义配置完成。'

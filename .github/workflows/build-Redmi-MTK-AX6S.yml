@@ -192,6 +192,46 @@ jobs:
                   ', '.join(sorted(missing))
               )
 
+          # 检查 iptables 两种实现是否发生冲突。
+          if (
+              'iptables-nft' in selected
+              and 'iptables-zz-legacy' in selected
+          ):
+              abort(
+                  'iptables-nft 与 iptables-zz-legacy '
+                  '不能同时安装，请检查固件配置'
+              )
+
+          # SSR Plus 使用 nftables 透明代理。
+          if 'luci-app-ssr-plus' in selected:
+              if (
+                  'luci-app-ssr-plus_Nftables_Transparent_Proxy'
+                  not in selected
+              ):
+                  abort(
+                      '当前固件要求 SSR Plus 使用 '
+                      'nftables 透明代理后端'
+                  )
+
+          # 缺少 Kcptun 软件包时禁止进入正式编译。
+          if 'luci-app-ssr-plus_INCLUDE_Kcptun' in selected:
+              kcptun_packages = list(
+                  Path('package/feeds').glob(
+                      '*/kcptun-client/Makefile'
+                  )
+              )
+
+              if not kcptun_packages:
+                  abort(
+                      'SSR Plus 启用了 Kcptun，'
+                      '但软件源中不存在 kcptun-client'
+                  )
+
+          print(
+              '[依赖预检] iptables 和 SSR Plus '
+              '依赖检查通过'
+          )
+          
           # libcronet 源码编译会引入 GN，必须禁止。
           if 'libcronet' in selected:
               abort(

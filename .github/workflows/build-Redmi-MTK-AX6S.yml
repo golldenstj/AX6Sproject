@@ -1,7 +1,7 @@
 
 # Redmi AX6S OpenWrt 自动构建。
-# NaiveProxy、Xray 使用官方最新正式版预编译程序，保持原软件包与 LuCI 集成。
-# 其他固件组件依旧从 ImmortalWrt master 源码构建。
+# NaiveProxy、Xray、Sing-box 均使用官方 ARM64 预编译程序。
+# 构建前检查实际 Feeds 选中来源和 GN 依赖，避免上游变更重新引入 Chromium 编译。
 name: Build Redmi-MTK-AX6S OpenWrt
 
 on:
@@ -36,7 +36,7 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      # 保留原有磁盘清理方式，避免大体积工具链占满 Runner。
+      # 保留原有磁盘清理方式，避免大体积工具链占满运行环境。
       - name: Before freeing up disk space
         run: df -hT
 
@@ -78,8 +78,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@main
 
-      # 移除只供旧 GN 验证使用的 GCC 12 专项安装及 GN 编译步骤。
-      # 若其他组件需要 GCC/Go，OpenWrt 仍会按依赖正常准备。
       - name: Initialization environment
         env:
           DEBIAN_FRONTEND: noninteractive
@@ -112,8 +110,8 @@ jobs:
       - name: Install feeds
         run: cd openwrt && ./scripts/feeds install -a
 
-      # 下载最新正式版预编译资产、核验 SHA256 和 ARM64 ELF，生成本地 OpenWrt 包规则。
-      # GitHub 令牌仅用于查询公开 Release 接口，不传到固件，也不用于文件直链下载。
+      # 完成官方预编译封装，生成版本清单。
+      # 保持软件包名、配置文件和服务脚本不变。
       - name: Load custom configuration and prebuilt binaries
         env:
           GH_TOKEN: ${{ github.token }}
@@ -126,6 +124,7 @@ jobs:
           test -s ax6s-prebuilt-versions.txt
           test -s feeds/packages/net/naiveproxy/files/ax6s-prebuilt/naive
           test -s feeds/packages/net/xray-core/files/ax6s-prebuilt/xray
+          test -s feeds/packages/net/sing-box/files/ax6s-prebuilt/sing-box
           cat ax6s-prebuilt-versions.txt
 
       - name: SSH connection to Actions
@@ -135,17 +134,73 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
 
-      # 官方二进制已在上一阶段下载，无需预编译 GN 或 Go 版本的 Xray。
-      # 其他软件包仍沿用原来的下载流程。
-      - name: Download package
-        id: package
+      # 先完成配置解析，再对实际软件包来源及所选依赖做前置验证。
+      # 即使上游以后增加其它 GN 使用者，也尽量在耗时编译前发现。
+      - name: Preflight GN dependency and prebuilt package audit
         run: |
           cd openwrt
+          # 软件包规则在 Feeds 安装之后被改写，强制刷新依赖元数据。
+          rm -rf tmp
           make defconfig
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          def abort(message):
+              print(f'::error::{message}', flush=True)
+              sys.exit(1)
+
+          config = Path('.config').read_text(errors='replace')
+          selected = set(re.findall(r'^CONFIG_PACKAGE_([^=]+)=y$', config, re.M))
+          if 'sing-box' not in selected or 'naiveproxy' not in selected or 'xray-core' not in selected:
+              abort('三个官方预编译核心有一个未被选中，请检查 .config')
+          if 'libcronet' in selected:
+              abort('libcronet 仍被选中，会触发 GN/Chromium 源码构建')
+
+          # 安装所有 Feeds 时可能存在同名包覆盖，因此必须校验实际来源。
+          for pkg, expected in {
+              'naiveproxy': 'feeds/packages/net/naiveproxy/Makefile',
+              'xray-core': 'feeds/packages/net/xray-core/Makefile',
+              'sing-box': 'feeds/packages/net/sing-box/Makefile',
+          }.items():
+              active = Path('package/feeds/packages') / pkg / 'Makefile'
+              source = Path(expected)
+              if not active.is_file() or not source.is_file() or active.resolve() != source.resolve():
+                  abort(f'{pkg} 的实际 Feeds 来源不符合预期：{active} -> {active.resolve()}')
+              makefile = active.read_text(errors='replace')
+              if f'files/ax6s-prebuilt/{"sing-box" if pkg == "sing-box" else "naive" if pkg == "naiveproxy" else "xray"}' not in makefile:
+                  abort(f'{pkg} 被替换为非预编译 Makefile，禁止继续构建')
+              if 'gn/host' in makefile or 'golang/host' in makefile:
+                  abort(f'{pkg} 仍包含 GN 或 Go 源码构建依赖')
+              print(f'[GN-预检] {pkg}: 官方预编译封装 / 实际来源检查通过')
+
+          # 检查实际安装的软件包以及核心包。
+          # 只扫描最终选中的包，避免未选中的同名包产生误报。
+          files = set(Path('package/feeds').glob('*/*/Makefile'))
+          files.update(Path('package').rglob('Makefile'))
+          blockers = []
+          for mf in sorted(files):
+              if not mf.is_file():
+                  continue
+              content = mf.read_text(errors='replace')
+              names = set(re.findall(r'^define Package/([A-Za-z0-9_+.\-]+)\s*$', content, re.M))
+              # 同时兼容使用软件包名称变量定义的构建规则。
+              names.update(re.findall(r'^PKG_NAME\s*[:?+]?=\s*([A-Za-z0-9_+.\-]+)\s*$', content, re.M))
+              if not (names & selected):
+                  continue
+              if re.search(r'\bgn/host\b|(?<![\w-])gn\s+gen(?:\s|$)', content):
+                  blockers.append(f'{mf}: {", ".join(sorted(names & selected))}')
+
+          if blockers:
+              for item in blockers:
+                  print('::error::检测到实际选中包仍可能调用 GN：' + item)
+              sys.exit(1)
+          print(f'[GN-预检] 通过：共检查 {len(files)} 个安装/核心 Makefile，未发现所选软件包调用 GN')
+          PY
           make download -j8
           find dl -type f -size -1024c -print -delete
 
-      # 提前留存来源与版本，后续其他软件包编译失败时仍可审计。
       - name: Upload prebuilt version manifest
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
@@ -154,17 +209,28 @@ jobs:
           path: openwrt/ax6s-prebuilt-versions.txt
           if-no-files-found: ignore
 
-      # 编译失败后再用单线程详细日志复现，优先暴露最初错误。
+      # 不再执行整轮单线程重试。
+      # 编译失败时上传本轮日志，避免重复消耗大量时间。
       - name: Compile the firmware
         id: compile
         run: |
+          set -o pipefail
           cd openwrt
           echo "$(nproc) 线程编译"
-          make -j"$(nproc)" V=sc || make -j1 V=sc
+          make -j"$(nproc)" V=sc 2>&1 | tee "$GITHUB_WORKSPACE/ax6s-build.log"
           echo 'status=success' >> "$GITHUB_OUTPUT"
           grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
           [ ! -s DEVICE_NAME ] || echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> "$GITHUB_ENV"
           echo "FILE_DATE=_$(date +%Y%m%d%H%M)" >> "$GITHUB_ENV"
+
+      - name: Upload failed compile log
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: AX6S-build-failure-${{ github.run_number }}
+          path: ax6s-build.log
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Check space usage
         if: ${{ !cancelled() }}
@@ -209,7 +275,7 @@ jobs:
           ./transfer wet -s -p 16 --no-progress "${FIRMWARE}" 2>&1 | tee wetransfer.log
           echo "url=$(grep https wetransfer.log | cut -f3 -d' ')" >> "$GITHUB_OUTPUT"
 
-      # 必须确认编译成功且固件文件存在，避免创建空 Release。
+      # 编译成功且固件存在时才创建发布版本。
       - name: Generate release tag
         id: tag
         if: steps.compile.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true'
@@ -238,6 +304,7 @@ jobs:
             openwrt/bin/targets/mediatek/mt7622/immortalwrt-*squashfs*
             openwrt/ax6s-prebuilt-versions.txt
 
+      # 编译成功后按既有保留规则清理旧运行记录。
       - name: Delete workflow runs
         uses: wekingchen/delete-workflow-runs@main
         if: steps.compile.outputs.status == 'success'

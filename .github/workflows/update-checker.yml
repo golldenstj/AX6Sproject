@@ -1,7 +1,7 @@
-
-# 监控 Passwall 软件包上游更新。
-# 仅在对应提交的固件成功构建并发布后才视为已处理。
-# 旧版 HEAD-* 缓存不再作为成功依据，避免失败后漏编。
+# 自动监控 Passwall 软件源变化，并按固件类型分别判断是否需要自动构建。
+# 保留原策略：新提交第一次出现时，一次 repository_dispatch 同时触发普通版及 BaseFactory。
+# 两个固件各有独立成功缓存；只有真正发布成功才标记完成。
+# 某一固件失败后，下次检查只重试失败的固件。
 name: Update Checker
 
 on:
@@ -24,9 +24,7 @@ jobs:
   check:
     runs-on: ubuntu-22.04
     timeout-minutes: 15
-
     steps:
-      # 只获取上游分支的提交号，不克隆全部软件包。
       - name: 查询上游最新提交
         id: remote
         shell: bash
@@ -40,39 +38,69 @@ jobs:
                 break
               fi
             fi
-            echo "第 ${attempt} 次查询失败，稍后重试"
-            if [ "$attempt" -lt 5 ]; then
-              sleep $((attempt * 5))
-            fi
+            echo "上游查询第 ${attempt} 次未成功"
+            if (( attempt < 5 )); then sleep $((attempt * 5)); fi
           done
           if ! [[ "$sha" =~ ^[a-f0-9]{40}$ ]]; then
-            echo '::error::无法取得有效的上游提交号，本次不触发构建'
+            echo '::error::未获取到有效上游提交号，不触发任何构建'
             exit 1
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "上游最新提交：$sha"
 
-      # 这里查询的缓存由固件构建工作流在“发布成功之后”创建。
-      # 不允许更新检查器预先保存缓存，以免把失败提交误记为成功。
-      - name: 查询已成功构建的提交
-        id: success_cache
+      # 普通版继续沿用现有 v2 成功缓存，无需重置历史记录。
+      - name: 查询普通固件成功记录
+        id: normal_cache
         uses: actions/cache/restore@v4
         with:
           path: .ax6s-upstream-success-marker
           key: AX6S-upstream-success-v2-${{ steps.remote.outputs.sha }}
 
-      - name: 已有成功构建时跳过
-        if: steps.success_cache.outputs.cache-hit == 'true'
-        run: |
-          echo '上游当前提交已有成功发布的固件，本轮不重复构建。'
-          test "$(cat .ax6s-upstream-success-marker)" = '${{ steps.remote.outputs.sha }}'
+      # BaseFactory 用全新的独立缓存，不和普通版互相覆盖。
+      - name: 查询 BaseFactory 成功记录
+        id: base_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ax6s-basefactory-success-marker
+          key: AX6S-basefactory-success-v1-${{ steps.remote.outputs.sha }}
 
-      # 只在没有“构建+发布成功”记录时发起构建。
-      # 失败后没有记录，下一次定时检查将自动重新尝试。
-      - name: 触发 AX6S 固件编译
-        if: steps.success_cache.outputs.cache-hit != 'true'
+      - name: 分别决定两种固件是否需要编译
+        id: plan
+        shell: bash
+        env:
+          UPSTREAM_SHA: ${{ steps.remote.outputs.sha }}
+          NORMAL_HIT: ${{ steps.normal_cache.outputs.cache-hit }}
+          BASE_HIT: ${{ steps.base_cache.outputs.cache-hit }}
+        run: |
+          set -Eeuo pipefail
+          normal='build'
+          basefactory='build'
+          if [[ "$NORMAL_HIT" == 'true' && -s .ax6s-upstream-success-marker ]]; then
+            if [[ "$(cat .ax6s-upstream-success-marker)" == "$UPSTREAM_SHA" ]]; then
+              normal='skip'
+            fi
+          fi
+          if [[ "$BASE_HIT" == 'true' && -s .ax6s-basefactory-success-marker ]]; then
+            if [[ "$(cat .ax6s-basefactory-success-marker)" == "$UPSTREAM_SHA" ]]; then
+              basefactory='skip'
+            fi
+          fi
+          echo "normal=$normal" >> "$GITHUB_OUTPUT"
+          echo "basefactory=$basefactory" >> "$GITHUB_OUTPUT"
+          echo "普通版：$normal；BaseFactory：$basefactory"
+
+      # 仍然只发送一次 Source Code Update；两个工作流都会接收。
+      # 首次发现新上游提交时两个值都是 build，故两条工作流同时运行。
+      # 某个版本已完成时仅该版本跳过，另一版本继续重试。
+      - name: 按计划触发两个固件的自动构建
+        if: ${{ steps.plan.outputs.normal == 'build' || steps.plan.outputs.basefactory == 'build' }}
         uses: peter-evans/repository-dispatch@v3
         with:
           token: ${{ secrets.ACTIONS_TRIGGER_PAT || github.token }}
           event-type: Source Code Update
-          client-payload: '{"upstream_sha":"${{ steps.remote.outputs.sha }}","upstream_repo":"Openwrt-Passwall/openwrt-passwall-packages"}'
+          client-payload: >-
+            {"upstream_sha":"${{ steps.remote.outputs.sha }}","upstream_repo":"Openwrt-Passwall/openwrt-passwall-packages","normal":"${{ steps.plan.outputs.normal }}","basefactory":"${{ steps.plan.outputs.basefactory }}"}
+
+      - name: 两个固件均已经成功
+        if: ${{ steps.plan.outputs.normal == 'skip' && steps.plan.outputs.basefactory == 'skip' }}
+        run: echo '普通版与 BaseFactory 的当前上游提交均已成功发布，不再重复编译。'

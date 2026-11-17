@@ -1,13 +1,7 @@
-#
-# Copyright (c) 2019-2020 P3TERX <https://p3terx.com>
-#
-# This is free software, licensed under the MIT License.
-# See /LICENSE for more information.
-#
-# https://github.com/P3TERX/Actions-OpenWrt
-# Description: Build OpenWrt using GitHub Actions
-#
-
+# Redmi AX6S BaseFactory 固件构建。
+# 上游代码变化时与普通 AX6S 同时自动编译；分别记录成功状态，失败单独重试。
+# 保留 BaseFactory 专用 .config、原有 /workdir 编译布局及共享的 DIY 脚本。
+# 对初始化下载、GN 风险、失败日志与 Release 发布增加可靠性检查。
 name: Build Redmi-MTK-AX6S-BaseFactory OpenWrt
 
 on:
@@ -15,9 +9,10 @@ on:
   workflow_dispatch:
     inputs:
       ssh:
-        description: 'SSH connection to Actions'
+        description: '是否通过 SSH 进入 Actions 调试'
         required: false
-        default: 'false'
+        type: boolean
+        default: false
 
 env:
   REPO_URL: https://github.com/immortalwrt/immortalwrt
@@ -33,158 +28,387 @@ env:
   UPLOAD_RELEASE: true
   TZ: Asia/Shanghai
 
+permissions:
+  contents: write
+
+# 两种固件使用不同的并发组：自动构建时相互独立、可同时运行。
+concurrency:
+  group: ax6s-basefactory-build
+  cancel-in-progress: false
+
 jobs:
   build:
+    # 与普通固件共用同一上游更新事件，但成功记录独立；已成功时跳过此次重复任务。
+    # 手动编译不受此条件限制。
+    if: ${{ github.event_name != 'repository_dispatch' || github.event.action != 'Source Code Update' || github.event.client_payload.basefactory != 'skip' }}
     runs-on: ubuntu-22.04
+    timeout-minutes: 360
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@main
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Initialization environment
-      env:
-        DEBIAN_FRONTEND: noninteractive
-      run: |
-        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
-        sudo -E apt-get -qq update
-        sudo -E apt-get -qq install $(curl -fsSL raw.githubusercontent.com/wekingchen/my-file/master/depends-ubuntuLTS)
-        sudo -E apt-get -qq autoremove --purge
-        sudo -E apt-get -qq clean
-        sudo timedatectl set-timezone "$TZ"
-        sudo mkdir -p /workdir
-        sudo chown $USER:$GROUPS /workdir
-    
-    - name: Clone source code
-      working-directory: /workdir
-      run: |
-        df -hT $PWD
-        git clone $REPO_URL -b $REPO_BRANCH openwrt
-        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
-    
-    - name: Load custom feeds
-      run: |
-        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
-        chmod +x $DIY_P1_SH
-        cd openwrt
-        $GITHUB_WORKSPACE/$DIY_P1_SH
-    
-    - name: Update feeds
-      run: cd openwrt && ./scripts/feeds update -a
+      # APT 及远程依赖清单出现暂时性网络故障时进行有限次数重试。
+      - name: Initialization environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          (
+            set -Eeuo pipefail
 
-    - name: Install feeds
-      run: cd openwrt && ./scripts/feeds install -a
+            retry() {
+              local attempt=1
+              local max_attempts=5
+              while ! "$@"; do
+                if (( attempt >= max_attempts )); then
+                  echo "::error::重试 ${max_attempts} 次后仍失败：$*"
+                  return 1
+                fi
+                echo "第 ${attempt} 次失败，$((attempt * 8)) 秒后再次尝试"
+                sleep "$((attempt * 8))"
+                ((attempt += 1))
+              done
+            }
 
-    - name: Load custom configuration
-      run: |
-        [ -e files ] && mv files openwrt/files
-        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
-        chmod +x $DIY_P2_SH
-        cd openwrt
-        $GITHUB_WORKSPACE/$DIY_P2_SH
-    
-    - name: SSH connection to Actions
-      uses: P3TERX/ssh2actions@v1.0.0
-      if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh  != 'false') || contains(github.event.action, 'ssh')
-      env:
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+            sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+            retry sudo -E apt-get -o Acquire::Retries=4 -qq update
 
-    - name: Download package
-      id: package
-      run: |
-        cd openwrt
-        make defconfig
-        make download -j8
-        find dl -size -1024c -exec ls -l {} \;
-        find dl -size -1024c -exec rm -f {} \;
-    
-    - name: Compile the firmware
-      id: compile
-      run: |
-        cd openwrt
-        echo -e "$(nproc) thread compile"
-        make -j$(nproc) || make -j1 || make -j1 V=s
-        echo "status=success" >> $GITHUB_OUTPUT
-        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
-        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
-        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
-    
-    - name: Check space usage
-      if: (!cancelled())
-      run: df -hT
+            dependency_file="$RUNNER_TEMP/ax6s-basefactory-depends.txt"
+            retry curl -fSL --retry 4 --retry-delay 3 --retry-all-errors \
+              --connect-timeout 15 --max-time 120 \
+              -o "$dependency_file" \
+              'https://raw.githubusercontent.com/wekingchen/my-file/master/depends-ubuntuLTS'
 
-    - name: Upload bin directory
-      uses: actions/upload-artifact@main
-      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
-      with:
-        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: openwrt/bin
+            test -s "$dependency_file" || {
+              echo '::error::依赖清单为空，拒绝继续构建'
+              exit 1
+            }
 
-    - name: Organize files
-      id: organize
-      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
-      run: |
-        cd openwrt/bin/targets/*/*
-        rm -rf packages
-        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
-        echo "status=success" >> $GITHUB_OUTPUT
-    
-    - name: Upload firmware directory
-      uses: actions/upload-artifact@main
-      if: steps.organize.outputs.status == 'success' && !cancelled()
-      with:
-        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: ${{ env.FIRMWARE }}
+            # 检查每一个包名，避免异常 HTML 或错误文本被传给 apt-get。
+            mapfile -t dependencies < <(tr '[:space:]' '\n' < "$dependency_file" | sed '/^$/d')
+            (( ${#dependencies[@]} >= 30 )) || {
+              echo '::error::依赖清单数量异常'
+              exit 1
+            }
+            for pkg in "${dependencies[@]}"; do
+              if ! [[ "$pkg" =~ ^[A-Za-z0-9][A-Za-z0-9.+:-]*$ ]]; then
+                echo "::error::依赖清单中存在非法包名：$pkg"
+                exit 1
+              fi
+            done
 
-    - name: Upload firmware to cowtransfer
-      id: cowtransfer
-      if: steps.organize.outputs.status == 'success' && env.UPLOAD_COWTRANSFER == 'true' && !cancelled()
-      run: |
-        curl -fsSL git.io/file-transfer | sh
-        ./transfer cow --block 2621440 -s -p 64 --no-progress ${FIRMWARE} 2>&1 | tee cowtransfer.log
-        echo "::warning file=cowtransfer.com::$(cat cowtransfer.log | grep https)"
-        echo "url=$(cat cowtransfer.log | grep https | cut -f3 -d" ")" >> $GITHUB_OUTPUT
-    
-    - name: Upload firmware to WeTransfer
-      id: wetransfer
-      if: steps.organize.outputs.status == 'success' && env.UPLOAD_WETRANSFER == 'true' && !cancelled()
-      run: |
-        curl -fsSL git.io/file-transfer | sh
-        ./transfer wet -s -p 16 --no-progress ${FIRMWARE} 2>&1 | tee wetransfer.log
-        echo "::warning file=wetransfer.com::$(cat wetransfer.log | grep https)"
-        echo "url=$(cat wetransfer.log | grep https | cut -f3 -d" ")" >> $GITHUB_OUTPUT
-    
-    - name: Generate release tag
-      id: tag
-      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
-      run: |
-        echo "release_tag=$(date +"%Y.%m.%d-%H%M")-AX6S-MTK-BaseFactory" >> $GITHUB_OUTPUT
-        touch release.txt
-        [ $UPLOAD_COWTRANSFER = true ] && echo "🔗 [Cowtransfer](${{ steps.cowtransfer.outputs.url }})" >> release.txt
-        [ $UPLOAD_WETRANSFER = true ] && echo "🔗 [WeTransfer](${{ steps.wetransfer.outputs.url }})" >> release.txt
-        echo "status=success" >> $GITHUB_OUTPUT
-    
-    - name: Upload firmware to release
-      uses: softprops/action-gh-release@v1
-      if: steps.tag.outputs.status == 'success' && !cancelled()
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ steps.tag.outputs.release_tag }}
-        body_path: release.txt
-        files: /home/runner/work/AX6Sproject/AX6Sproject/openwrt/bin/targets/mediatek/mt7622/immortalwrt-*-factory*
+            echo "开始安装 ${#dependencies[@]} 项编译依赖"
+            retry sudo -E apt-get -o Acquire::Retries=4 -qq -y install "${dependencies[@]}"
+            retry sudo -E apt-get -o Acquire::Retries=4 -qq -y autoremove --purge
+            sudo -E apt-get -qq clean
+            sudo timedatectl set-timezone "$TZ"
+            sudo mkdir -p /workdir
+            sudo chown "$USER:$(id -gn)" /workdir
+            echo 'BaseFactory 初始化成功'
+          ) 2>&1 | tee "$GITHUB_WORKSPACE/ax6s-basefactory-init.log"
 
-    - name: Delete workflow runs
-      uses: wekingchen/delete-workflow-runs@main
-      with:
-        retain_days: 1
-        keep_minimum_runs: 10
+      # 保留原本的 /workdir 构建方式，避免无关的路径和磁盘行为变化。
+      - name: Clone source code
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          df -hT /workdir
+          git clone --single-branch -b "$REPO_BRANCH" "$REPO_URL" /workdir/openwrt
+          ln -s /workdir/openwrt "$GITHUB_WORKSPACE/openwrt"
 
-    - name: Remove old Releases
-      uses: dev-drprasad/delete-older-releases@v0.3.2
-      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
-      with:
-        keep_latest: 8
-        delete_tags: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Load custom feeds
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [ ! -e "$FEEDS_CONF" ] || mv "$FEEDS_CONF" openwrt/feeds.conf.default
+          chmod +x "$DIY_P1_SH"
+          cd openwrt
+          "$GITHUB_WORKSPACE/$DIY_P1_SH"
+
+      - name: Update feeds
+        run: cd openwrt && ./scripts/feeds update -a
+
+      - name: Install feeds
+        run: cd openwrt && ./scripts/feeds install -a
+
+      # 继续复用现有 DIY 脚本，但补上 GitHub API 令牌和准备日志。
+      - name: Load custom configuration and prebuilt binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [ ! -e files ] || mv files openwrt/files
+          [ ! -e "$CONFIG_FILE" ] || mv "$CONFIG_FILE" openwrt/.config
+          chmod +x "$DIY_P2_SH"
+          cd openwrt
+          "$GITHUB_WORKSPACE/$DIY_P2_SH" 2>&1 | tee "$GITHUB_WORKSPACE/ax6s-basefactory-prepare.log"
+          test -s ax6s-prebuilt-versions.txt
+          test -s feeds/packages/net/naiveproxy/files/ax6s-prebuilt/naive
+          test -s feeds/packages/net/xray-core/files/ax6s-prebuilt/xray
+          test -s feeds/packages/net/sing-box/files/ax6s-prebuilt/sing-box
+
+      - name: SSH connection to Actions
+        uses: P3TERX/ssh2actions@v1.0.0
+        if: ${{ inputs.ssh == true }}
+        env:
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
+      # BaseFactory 有自己的包选择，不强制三个代理核心都必须 =y。
+      # 但如果它们被选择，必须确实使用官方预编译规则。
+      - name: Preflight GN dependency and prebuilt package audit
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd openwrt
+          rm -rf tmp
+          make defconfig
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          def abort(message):
+              print(f'::error::{message}', flush=True)
+              sys.exit(1)
+
+          config = Path('.config').read_text(errors='replace')
+          selected = set(re.findall(r'^CONFIG_PACKAGE_([^=]+)=y$', config, re.M))
+
+          if 'libcronet' in selected:
+              abort('libcronet 被选中，会引入 GN/Chromium 源码构建')
+          if 'iptables-nft' in selected and 'iptables-zz-legacy' in selected:
+              abort('iptables-nft 与 iptables-zz-legacy 发生冲突')
+
+          expected_packages = {
+              'naiveproxy': ('feeds/packages/net/naiveproxy/Makefile', 'naive'),
+              'xray-core': ('feeds/packages/net/xray-core/Makefile', 'xray'),
+              'sing-box': ('feeds/packages/net/sing-box/Makefile', 'sing-box'),
+          }
+          for pkg, (expected, binary) in expected_packages.items():
+              active = Path('package/feeds/packages') / pkg / 'Makefile'
+              source = Path(expected)
+              if not active.is_file() or not source.is_file():
+                  abort(f'{pkg} 的软件包规则缺失：{active}')
+              if active.resolve() != source.resolve():
+                  abort(f'{pkg} 的实际软件包来源不正确：{active.resolve()}')
+              makefile = active.read_text(errors='replace')
+              if f'files/ax6s-prebuilt/{binary}' not in makefile:
+                  abort(f'{pkg} 未使用官方预编译规则')
+              if 'gn/host' in makefile or 'golang/host' in makefile:
+                  abort(f'{pkg} 仍包含 GN 或 Go 源码构建依赖')
+              print(f'[官方预编译检查] {pkg} 规则及路径正常')
+
+          files = set(Path('package').rglob('Makefile'))
+          blockers = []
+          for mf in sorted(files):
+              if not mf.is_file():
+                  continue
+              content = mf.read_text(errors='replace')
+              names = set(re.findall(
+                  r'^define Package/([A-Za-z0-9_+.\-]+)\s*$', content, re.M
+              ))
+              names.update(re.findall(
+                  r'^PKG_NAME\s*[:?+]?=\s*([A-Za-z0-9_+.\-]+)\s*$', content, re.M
+              ))
+              if not (names & selected):
+                  continue
+              if re.search(r'\bgn/host\b|(?<![\w-])gn\s+gen(?:\s|$)', content):
+                  blockers.append(str(mf))
+          if blockers:
+              abort('已选中的软件包仍引用 GN：' + ', '.join(blockers[:20]))
+
+          print(f'[GN 预检] 已检查 {len(files)} 个 Makefile，未发现已选包直接调用 GN')
+          PY
+
+      - name: Download packages
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd openwrt
+          (
+            for attempt in 1 2 3; do
+              if make download -j8; then
+                break
+              fi
+              if [ "$attempt" -eq 3 ]; then
+                echo '::error::依赖下载三次失败'
+                exit 1
+              fi
+              echo "依赖下载第 ${attempt} 次失败，稍后重试"
+              sleep $((attempt * 10))
+            done
+            find dl -type f -size -1024c -print -delete
+          ) 2>&1 | tee "$GITHUB_WORKSPACE/ax6s-basefactory-download.log"
+
+      - name: Upload prebuilt version manifest
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: AX6S-BaseFactory-prebuilt-versions
+          path: openwrt/ax6s-prebuilt-versions.txt
+          if-no-files-found: ignore
+
+      # 正常精简输出，失败即停止，不再耗时重复单线程整轮编译。
+      - name: Compile the firmware
+        id: compile
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd openwrt
+          echo "$(nproc) 线程编译 BaseFactory 固件"
+          make -j"$(nproc)" 2>&1 | tee "$GITHUB_WORKSPACE/ax6s-basefactory-build.log"
+          echo 'status=success' >> "$GITHUB_OUTPUT"
+          grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+          if [ -s DEVICE_NAME ]; then
+            echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> "$GITHUB_ENV"
+          fi
+          echo "FILE_DATE=_$(date +%Y%m%d%H%M)" >> "$GITHUB_ENV"
+
+      - name: Upload failed build logs
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: AX6S-BaseFactory-failure-${{ github.run_number }}
+          path: |
+            ax6s-basefactory-init.log
+            ax6s-basefactory-prepare.log
+            ax6s-basefactory-download.log
+            ax6s-basefactory-build.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Check space usage
+        if: ${{ !cancelled() }}
+        run: df -hT
+
+      - name: Upload bin directory
+        if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: BaseFactory_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+          path: openwrt/bin
+
+      - name: Organize files
+        id: organize
+        if: steps.compile.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd openwrt/bin/targets/*/*
+          rm -rf packages
+          echo "FIRMWARE=$PWD" >> "$GITHUB_ENV"
+          echo 'status=success' >> "$GITHUB_OUTPUT"
+
+      - name: Upload firmware directory
+        if: steps.organize.outputs.status == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: BaseFactory_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+          path: ${{ env.FIRMWARE }}
+
+      - name: Upload firmware to cowtransfer
+        id: cowtransfer
+        if: steps.organize.outputs.status == 'success' && env.UPLOAD_COWTRANSFER == 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          curl -fsSL git.io/file-transfer | sh
+          ./transfer cow --block 2621440 -s -p 64 --no-progress "$FIRMWARE" 2>&1 | tee cowtransfer.log
+          echo "url=$(grep https cowtransfer.log | cut -f3 -d' ')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload firmware to WeTransfer
+        id: wetransfer
+        if: steps.organize.outputs.status == 'success' && env.UPLOAD_WETRANSFER == 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          curl -fsSL git.io/file-transfer | sh
+          ./transfer wet -s -p 16 --no-progress "$FIRMWARE" 2>&1 | tee wetransfer.log
+          echo "url=$(grep https wetransfer.log | cut -f3 -d' ')" >> "$GITHUB_OUTPUT"
+
+      # 正式发布前必须确认存在实际的 factory 固件，不得创建空 Release。
+      - name: Generate release tag
+        id: tag
+        if: steps.compile.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          shopt -s nullglob
+          dir=openwrt/bin/targets/mediatek/mt7622
+          images=("$dir"/immortalwrt-*-factory*)
+          (( ${#images[@]} > 0 )) || {
+            echo '::error::没有找到 BaseFactory factory 固件，拒绝发布'
+            exit 1
+          }
+          echo "发现 ${#images[@]} 个 factory 产物"
+          echo "release_tag=$(date +%Y.%m.%d-%H%M)-AX6S-MTK-BaseFactory" >> "$GITHUB_OUTPUT"
+          cp openwrt/ax6s-prebuilt-versions.txt release.txt
+          if [ "$UPLOAD_COWTRANSFER" = true ]; then
+            echo "Cowtransfer: ${{ steps.cowtransfer.outputs.url }}" >> release.txt
+          fi
+          if [ "$UPLOAD_WETRANSFER" = true ]; then
+            echo "WeTransfer: ${{ steps.wetransfer.outputs.url }}" >> release.txt
+          fi
+          echo 'status=success' >> "$GITHUB_OUTPUT"
+
+      - name: Upload firmware to release
+        id: release
+        if: steps.tag.outputs.status == 'success'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.release_tag }}
+          body_path: release.txt
+          fail_on_unmatched_files: true
+          files: |
+            openwrt/bin/targets/mediatek/mt7622/immortalwrt-*-factory*
+            openwrt/ax6s-prebuilt-versions.txt
+
+      # 只在自动触发且 Release 发布真正成功后写入 BaseFactory 专属成功记录。
+      # 不与普通固件共用成功缓存，防止一条成功掩盖另一条失败。
+      - name: 确认 BaseFactory 已发布并记录上游提交
+        id: upstream_success
+        if: ${{ steps.release.outcome == 'success' && github.event_name == 'repository_dispatch' && github.event.action == 'Source Code Update' }}
+        env:
+          UPSTREAM_SHA: ${{ github.event.client_payload.upstream_sha }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if ! [[ "$UPSTREAM_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            echo '::error::自动更新事件缺少有效 upstream_sha，禁止将其标记为成功'
+            exit 1
+          fi
+          printf '%s\n' "$UPSTREAM_SHA" > .ax6s-basefactory-success-marker
+          echo "sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: 保存 BaseFactory 独立成功缓存
+        if: ${{ steps.upstream_success.outputs.sha != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .ax6s-basefactory-success-marker
+          key: AX6S-basefactory-success-v1-${{ steps.upstream_success.outputs.sha }}
+
+      # 仅在成功编译和发布以后清理旧记录；清理失败不影响固件结果。
+      - name: Delete workflow runs
+        if: steps.tag.outputs.status == 'success'
+        uses: wekingchen/delete-workflow-runs@main
+        continue-on-error: true
+        with:
+          retain_days: 1
+          keep_minimum_runs: 10
+
+      - name: Remove old Releases
+        if: steps.tag.outputs.status == 'success'
+        uses: dev-drprasad/delete-older-releases@v0.3.4
+        continue-on-error: true
+        with:
+          keep_latest: 8
+          delete_tags: true
+          # 只清理 BaseFactory 系列，不碰普通版固件。
+          delete_tag_pattern: '^[0-9]{4}\.[0-9]{2}\.[0-9]{2}-[0-9]{4}-AX6S-MTK-BaseFactory$' 
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,8 +1,7 @@
 
-# Redmi AX6S OpenWrt 自动构建。
-# NaiveProxy、Xray、Sing-box 均使用官方 ARM64 预编译程序。
-# 构建前检查实际软件包来源和 GN 依赖，避免重新编译 Chromium。
-# 准备与编译阶段分别保留日志，失败后自动上传。
+# 红米 AX6S OpenWrt 固件自动构建。
+# NaiveProxy、Xray、Sing-box 使用官方 ARM64 预编译核心，保持现有软件包与服务配置。
+# 对 APT 和依赖下载增加重试与校验；仅在固件发布成功后记录自动更新提交。
 name: Build Redmi-MTK-AX6S OpenWrt
 
 on:
@@ -32,18 +31,21 @@ permissions:
   contents: write
   actions: write
 
+# 防止多个固件编译同时占用资源；同组只保留最新的待处理构建请求。
+concurrency:
+  group: ax6s-firmware-build
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-22.04
     timeout-minutes: 360
 
     steps:
-      # 查看初始磁盘空间。
+      # 保留已经验证可用的磁盘空间优化设置。
       - name: Before freeing up disk space
         run: df -hT
 
-      # 清理不需要的预装软件和缓存。
-      # 保留现有磁盘优化方案。
       - name: Optimize Disk Space
         uses: hugoalh/disk-space-optimizer-ghaction@v0.8.1
         with:
@@ -65,7 +67,6 @@ jobs:
           npm_clean: 'True'
           os_swap: 'True'
 
-      # 扩展可用编译空间。
       - name: Freeing up disk space
         uses: wekingchen/maximize-build-space@master
         with:
@@ -80,32 +81,86 @@ jobs:
       - name: Free up disk space complete
         run: df -hT
 
-      # 检出当前仓库代码。
       - name: Checkout
         uses: actions/checkout@main
 
-      # 安装编译依赖并配置时区。
+      # 初始化环境：APT 和远程依赖清单最多重试五次，失败会保留日志。
       - name: Initialization environment
         env:
           DEBIAN_FRONTEND: noninteractive
+        shell: bash
         run: |
-          sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
-          sudo -E apt-get -qq update
-          sudo -E apt-get -qq install $(curl -fsSL raw.githubusercontent.com/wekingchen/my-file/master/depends-ubuntuLTS)
-          sudo -E apt-get -qq autoremove --purge
-          sudo -E apt-get -qq remove subversion
-          sudo -E apt-get -qq install subversion
-          sudo -E apt-get -qq clean
-          sudo timedatectl set-timezone "$TZ"
-          sudo chown "$USER:$GROUPS" "$GITHUB_WORKSPACE"
+          set -Eeuo pipefail
+          (
+            set -Eeuo pipefail
 
-      # 克隆 ImmortalWrt 最新源码。
+            # 对短暂的网络故障进行有限次数重试，最终仍失败则中止构建。
+            retry() {
+              local attempt=1
+              local max_attempts=5
+              local delay=8
+              while ! "$@"; do
+                if (( attempt >= max_attempts )); then
+                  echo "::error::命令重试 ${max_attempts} 次仍失败：$*"
+                  return 1
+                fi
+                echo "第 ${attempt} 次失败，$((attempt * delay)) 秒后重试：$*"
+                sleep "$((attempt * delay))"
+                ((attempt += 1))
+              done
+            }
+
+            sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+
+            # APT 本身还会对下载失败进行重试。
+            retry sudo -E apt-get -o Acquire::Retries=4 -qq update
+
+            # 必须使用 HTTPS，下载完成后校验内容，再交给 apt-get。
+            dependency_file="$RUNNER_TEMP/ax6s-depends-ubuntuLTS.txt"
+            retry curl -fSL --retry 4 --retry-delay 3 --retry-all-errors \
+              --connect-timeout 15 --max-time 120 \
+              -o "$dependency_file" \
+              'https://raw.githubusercontent.com/wekingchen/my-file/master/depends-ubuntuLTS'
+
+            test -s "$dependency_file" || {
+              echo '::error::编译依赖清单为空，拒绝继续安装'
+              exit 1
+            }
+
+            # 依赖文件应只包含 Ubuntu 软件包名，避免下载异常被误当成包名。
+            if ! tr '[:space:]' '\n' < "$dependency_file" | grep -Ev '^$' \
+              | grep -Eq '^[A-Za-z0-9][A-Za-z0-9.+:-]*$'; then
+              echo '::error::依赖清单未包含有效软件包名'
+              exit 1
+            fi
+            if tr '[:space:]' '\n' < "$dependency_file" | grep -Ev '^$' \
+              | grep -Ev '^[A-Za-z0-9][A-Za-z0-9.+:-]*$'; then
+              echo '::error::依赖清单中包含非法内容，拒绝继续安装'
+              exit 1
+            fi
+
+            read -r -a dependencies <<< "$(tr '\n' ' ' < "$dependency_file")"
+            echo "共准备安装 ${#dependencies[@]} 个依赖软件包"
+            (( ${#dependencies[@]} >= 30 )) || {
+              echo '::error::依赖清单条目数异常，拒绝继续构建'
+              exit 1
+            }
+            retry sudo -E apt-get -o Acquire::Retries=4 -qq -y install "${dependencies[@]}"
+
+            retry sudo -E apt-get -o Acquire::Retries=4 -qq -y autoremove --purge
+            retry sudo -E apt-get -o Acquire::Retries=4 -qq -y remove subversion
+            retry sudo -E apt-get -o Acquire::Retries=4 -qq -y install subversion
+            sudo -E apt-get -qq clean
+            sudo timedatectl set-timezone "$TZ"
+            sudo chown "$USER:$(id -gn)" "$GITHUB_WORKSPACE"
+            echo '初始化环境完成'
+          ) 2>&1 | tee "$GITHUB_WORKSPACE/ax6s-init.log"
+
       - name: Clone source code
         run: |
           df -hT "$PWD"
           git clone --single-branch -b "$REPO_BRANCH" "$REPO_URL" openwrt
 
-      # 加载自定义软件源。
       - name: Load custom feeds
         run: |
           [ ! -e "$FEEDS_CONF" ] || mv "$FEEDS_CONF" openwrt/feeds.conf.default
@@ -113,42 +168,31 @@ jobs:
           cd openwrt
           "$GITHUB_WORKSPACE/$DIY_P1_SH"
 
-      # 更新所有软件源。
       - name: Update feeds
         run: cd openwrt && ./scripts/feeds update -a
 
-      # 安装所有软件源的软件包定义。
       - name: Install feeds
         run: cd openwrt && ./scripts/feeds install -a
 
-      # 加载自定义配置并封装官方预编译核心。
-      # 保留 NaiveProxy、Xray、Sing-box 的原有软件包名称和服务文件。
-      # 全程保存日志，解决准备阶段出错却没有附件的问题。
+      # 保留已经编译成功的脚本与官方预编译程序封装逻辑。
       - name: Load custom configuration and prebuilt binaries
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -o pipefail
-
           [ ! -e files ] || mv files openwrt/files
           [ ! -e "$CONFIG_FILE" ] || mv "$CONFIG_FILE" openwrt/.config
-
           chmod +x "$DIY_P2_SH"
           cd openwrt
-
-          # 保存准备阶段的全部输出并保留真实退出状态。
           "$GITHUB_WORKSPACE/$DIY_P2_SH" 2>&1 | tee "$GITHUB_WORKSPACE/ax6s-prepare.log"
 
-          # 验证三个官方预编译程序及版本清单。
           test -s ax6s-prebuilt-versions.txt
           test -s feeds/packages/net/naiveproxy/files/ax6s-prebuilt/naive
           test -s feeds/packages/net/xray-core/files/ax6s-prebuilt/xray
           test -s feeds/packages/net/sing-box/files/ax6s-prebuilt/sing-box
-
           echo '三个官方预编译组件准备完成'
           cat ax6s-prebuilt-versions.txt
 
-      # 可选的远程调试入口。
       - name: SSH connection to Actions
         uses: P3TERX/ssh2actions@v1.0.0
         if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh != 'false') || contains(github.event.action, 'ssh')
@@ -156,13 +200,10 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
 
-      # 编译前完成配置解析和 GN 依赖审计。
-      # 避免进入耗时的正式编译之后才发现依赖问题。
+      # GN 依赖及预编译来源检查，沿用此前已验证规则。
       - name: Preflight GN dependency and prebuilt package audit
         run: |
           cd openwrt
-
-          # 软件包规则已经被自定义脚本改写，刷新旧的依赖元数据。
           rm -rf tmp
           make defconfig
 
@@ -175,197 +216,92 @@ jobs:
               print(f'::error::{message}', flush=True)
               sys.exit(1)
 
-          # 读取最终解析后的软件包选择。
           config = Path('.config').read_text(errors='replace')
           selected = set(re.findall(
-              r'^CONFIG_PACKAGE_([^=]+)=y$',
-              config,
-              re.M
+              r'^CONFIG_PACKAGE_([^=]+)=y$', config, re.M
           ))
 
-          # 三款官方预编译组件必须处于启用状态。
           required = {'sing-box', 'naiveproxy', 'xray-core'}
           missing = required - selected
-
           if missing:
-              abort(
-                  '以下官方预编译核心未被选中：' +
-                  ', '.join(sorted(missing))
-              )
+              abort('以下官方预编译核心未被选中：' + ', '.join(sorted(missing)))
 
-          # 检查 iptables 两种实现是否发生冲突。
-          if (
-              'iptables-nft' in selected
-              and 'iptables-zz-legacy' in selected
-          ):
-              abort(
-                  'iptables-nft 与 iptables-zz-legacy '
-                  '不能同时安装，请检查固件配置'
-              )
+          if 'iptables-nft' in selected and 'iptables-zz-legacy' in selected:
+              abort('iptables-nft 与 iptables-zz-legacy 不能同时安装，请检查固件配置')
 
-          # SSR Plus 使用 nftables 透明代理。
           if 'luci-app-ssr-plus' in selected:
-              if (
-                  'luci-app-ssr-plus_Nftables_Transparent_Proxy'
-                  not in selected
-              ):
-                  abort(
-                      '当前固件要求 SSR Plus 使用 '
-                      'nftables 透明代理后端'
-                  )
+              if 'luci-app-ssr-plus_Nftables_Transparent_Proxy' not in selected:
+                  abort('当前固件要求 SSR Plus 使用 nftables 透明代理后端')
 
-          # 缺少 Kcptun 软件包时禁止进入正式编译。
           if 'luci-app-ssr-plus_INCLUDE_Kcptun' in selected:
-              kcptun_packages = list(
-                  Path('package/feeds').glob(
-                      '*/kcptun-client/Makefile'
-                  )
-              )
-
+              kcptun_packages = list(Path('package/feeds').glob('*/kcptun-client/Makefile'))
               if not kcptun_packages:
-                  abort(
-                      'SSR Plus 启用了 Kcptun，'
-                      '但软件源中不存在 kcptun-client'
-                  )
+                  abort('SSR Plus 启用了 Kcptun，但软件源中不存在 kcptun-client')
 
-          print(
-              '[依赖预检] iptables 和 SSR Plus '
-              '依赖检查通过'
-          )
-          
-          # libcronet 源码编译会引入 GN，必须禁止。
+          print('[依赖预检] iptables 和 SSR Plus 依赖检查通过')
+
           if 'libcronet' in selected:
-              abort(
-                  'libcronet 仍被选中，'
-                  '可能触发 GN/Chromium 源码编译'
-              )
+              abort('libcronet 仍被选中，可能触发 GN/Chromium 源码编译')
 
-          # 核对三个核心实际安装的软件包来源。
-          # 防止同名软件包被其他软件源覆盖。
           expected_packages = {
-              'naiveproxy': (
-                  'feeds/packages/net/naiveproxy/Makefile',
-                  'naive'
-              ),
-              'xray-core': (
-                  'feeds/packages/net/xray-core/Makefile',
-                  'xray'
-              ),
-              'sing-box': (
-                  'feeds/packages/net/sing-box/Makefile',
-                  'sing-box'
-              ),
+              'naiveproxy': ('feeds/packages/net/naiveproxy/Makefile', 'naive'),
+              'xray-core': ('feeds/packages/net/xray-core/Makefile', 'xray'),
+              'sing-box': ('feeds/packages/net/sing-box/Makefile', 'sing-box'),
           }
 
           for pkg, (expected, binary) in expected_packages.items():
-              active = (
-                  Path('package/feeds/packages') /
-                  pkg /
-                  'Makefile'
-              )
+              active = Path('package/feeds/packages') / pkg / 'Makefile'
               source = Path(expected)
-
               if not active.is_file() or not source.is_file():
-                  abort(
-                      f'{pkg} 的软件包规则不存在：{active}'
-                  )
-
+                  abort(f'{pkg} 的软件包规则不存在：{active}')
               if active.resolve() != source.resolve():
-                  abort(
-                      f'{pkg} 的实际软件包来源不符合预期：'
-                      f'{active} -> {active.resolve()}'
-                  )
+                  abort(f'{pkg} 的实际软件包来源不符合预期：{active} -> {active.resolve()}')
 
               makefile = active.read_text(errors='replace')
-
-              # 确认规则使用我们下载的官方二进制。
               marker = f'files/ax6s-prebuilt/{binary}'
-
               if marker not in makefile:
-                  abort(
-                      f'{pkg} 未使用官方预编译封装，'
-                      '禁止继续编译'
-                  )
-
-              # 官方预编译核心不应重新调用 GN 或 Go 工具链。
+                  abort(f'{pkg} 未使用官方预编译封装，禁止继续编译')
               if 'gn/host' in makefile or 'golang/host' in makefile:
-                  abort(
-                      f'{pkg} 仍包含 GN 或 Go 源码构建依赖'
-                  )
+                  abort(f'{pkg} 仍包含 GN 或 Go 源码构建依赖')
+              print(f'[GN-预检] {pkg}：官方预编译封装和软件包来源检查通过')
 
-              print(
-                  f'[GN-预检] {pkg}：'
-                  '官方预编译封装和软件包来源检查通过'
-              )
-
-          # 扫描安装的软件包和核心软件包规则。
-          # 针对最终选中的包检查是否显式调用 GN。
-          files = set(
-              Path('package/feeds').glob('*/*/Makefile')
-          )
-          files.update(
-              Path('package').rglob('Makefile')
-          )
-
+          files = set(Path('package/feeds').glob('*/*/Makefile'))
+          files.update(Path('package').rglob('Makefile'))
           blockers = []
 
           for mf in sorted(files):
               if not mf.is_file():
                   continue
-
               content = mf.read_text(errors='replace')
-
               names = set(re.findall(
-                  r'^define Package/([A-Za-z0-9_+.\-]+)\s*$',
-                  content,
-                  re.M
+                  r'^define Package/([A-Za-z0-9_+.\-]+)\s*$', content, re.M
               ))
-
               names.update(re.findall(
-                  r'^PKG_NAME\s*[:?+]?=\s*'
-                  r'([A-Za-z0-9_+.\-]+)\s*$',
-                  content,
-                  re.M
+                  r'^PKG_NAME\s*[:?+]?=\s*([A-Za-z0-9_+.\-]+)\s*$', content, re.M
               ))
-
               matched = names & selected
-
               if not matched:
                   continue
-
-              # 查找已知的 GN 主机依赖或直接生成命令。
               uses_gn = re.search(
-                  r'\bgn/host\b|'
-                  r'(?<![\w-])gn\s+gen(?:\s|$)',
-                  content
+                  r'\bgn/host\b|(?<![\w-])gn\s+gen(?:\s|$)', content
               )
-
               if uses_gn:
-                  blockers.append(
-                      f'{mf}: {", ".join(sorted(matched))}'
-                  )
+                  blockers.append(f'{mf}: {", ".join(sorted(matched))}')
 
           if blockers:
               for item in blockers:
-                  print(
-                      '::error::检测到已选软件包可能调用 GN：' +
-                      item
-                  )
+                  print('::error::检测到已选软件包可能调用 GN：' + item)
               sys.exit(1)
 
           print(
-              f'[GN-预检] 通过：检查了 {len(files)} '
-              '个软件包规则，未发现已选软件包直接调用 GN'
+              f'[GN-预检] 通过：检查了 {len(files)} 个软件包规则，'
+              '未发现已选软件包直接调用 GN'
           )
           PY
 
-          # GN 预检通过后再下载其它源码依赖。
           make download -j8
-
-          # 删除明显不完整的下载文件。
           find dl -type f -size -1024c -print -delete
 
-      # 无论后续编译是否成功，都保留官方组件版本清单。
       - name: Upload prebuilt version manifest
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
@@ -374,49 +310,35 @@ jobs:
           path: openwrt/ax6s-prebuilt-versions.txt
           if-no-files-found: ignore
 
-      # 正式编译固件。
-      # 不再在失败后执行整轮单线程重试。
-      # 使用管道错误传递，避免日志命令掩盖真实错误。
       - name: Compile the firmware
         id: compile
         run: |
           set -o pipefail
           cd openwrt
-
           echo "$(nproc) 线程编译"
-
-          # 同步输出并保存完整编译日志。
-          make -j"$(nproc)" V=sc 2>&1 | tee "$GITHUB_WORKSPACE/ax6s-build.log"
-
+          make -j"$(nproc)" 2>&1 | tee "$GITHUB_WORKSPACE/ax6s-build.log"
           echo 'status=success' >> "$GITHUB_OUTPUT"
-
-          # 保存设备名称与编译时间。
           grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
-
           [ ! -s DEVICE_NAME ] || echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> "$GITHUB_ENV"
-
           echo "FILE_DATE=_$(date +%Y%m%d%H%M)" >> "$GITHUB_ENV"
 
-      # 构建失败时自动上传已经生成的日志。
-      # 准备阶段失败时也能取得 ax6s-prepare.log。
-      # 编译阶段失败时同时保留准备日志和编译日志。
+      # 任何失败都上传当前已经生成的初始化、准备、编译日志。
       - name: Upload failed build logs
         if: ${{ failure() }}
         uses: actions/upload-artifact@v4
         with:
           name: AX6S-build-failure-${{ github.run_number }}
           path: |
+            ax6s-init.log
             ax6s-prepare.log
             ax6s-build.log
           if-no-files-found: warn
           retention-days: 14
 
-      # 检查编译完成后的磁盘占用。
       - name: Check space usage
         if: ${{ !cancelled() }}
         run: df -hT
 
-      # 保存全部软件包与固件产物。
       - name: Upload bin directory
         uses: actions/upload-artifact@v4
         if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
@@ -424,7 +346,6 @@ jobs:
           name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
           path: openwrt/bin
 
-      # 按原有配置决定是否单独上传固件目录。
       - name: Organize files
         id: organize
         if: steps.compile.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true'
@@ -441,7 +362,6 @@ jobs:
           name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
           path: ${{ env.FIRMWARE }}
 
-      # 保留原有的可选第三方文件传输功能。
       - name: Upload firmware to cowtransfer
         id: cowtransfer
         if: steps.organize.outputs.status == 'success' && env.UPLOAD_COWTRANSFER == 'true'
@@ -458,36 +378,28 @@ jobs:
           ./transfer wet -s -p 16 --no-progress "${FIRMWARE}" 2>&1 | tee wetransfer.log
           echo "url=$(grep https wetransfer.log | cut -f3 -d' ')" >> "$GITHUB_OUTPUT"
 
-      # 编译成功且找到有效固件文件才允许发布。
+      # 与此前成功版本一致，只有发现有效固件文件才能发布。
       - name: Generate release tag
         id: tag
         if: steps.compile.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true'
         run: |
           shopt -s nullglob
-
           dir=openwrt/bin/targets/mediatek/mt7622
           images=("$dir"/immortalwrt-*squashfs* "$dir"/immortalwrt-*-factory.bin)
-
           ((${#images[@]} > 0)) || {
             echo '没有找到 squashfs 固件，停止发布' >&2
             exit 1
           }
-
           echo "release_tag=$(date +%Y.%m.%d-%H%M)-AX6S-MTK" >> "$GITHUB_OUTPUT"
-
           cp openwrt/ax6s-prebuilt-versions.txt release.txt
-
           if [ "$UPLOAD_COWTRANSFER" = true ]; then
             echo "Cowtransfer: ${{ steps.cowtransfer.outputs.url }}" >> release.txt
           fi
-
           if [ "$UPLOAD_WETRANSFER" = true ]; then
             echo "WeTransfer: ${{ steps.wetransfer.outputs.url }}" >> release.txt
           fi
-
           echo 'status=success' >> "$GITHUB_OUTPUT"
 
-      # 自动创建 GitHub Release 并上传固件。
       - name: Upload firmware to release
         uses: softprops/action-gh-release@v2
         if: steps.tag.outputs.status == 'success'
@@ -501,18 +413,43 @@ jobs:
             openwrt/bin/targets/mediatek/mt7622/sha256sums
             openwrt/ax6s-prebuilt-versions.txt
 
-      # 仅在成功编译后清理旧的工作流运行记录。
+      # 只有自动更新触发、且前面的固件发布成功，才准备成功标记。
+      - name: 验证上游提交并生成成功标记
+        id: upstream_success
+        if: steps.tag.outputs.status == 'success' && github.event_name == 'repository_dispatch' && github.event.action == 'Source Code Update'
+        env:
+          UPSTREAM_SHA: ${{ github.event.client_payload.upstream_sha }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if ! [[ "$UPSTREAM_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            echo '::error::自动更新请求缺少有效 upstream_sha，禁止记录成功状态'
+            exit 1
+          fi
+          printf '%s\n' "$UPSTREAM_SHA" > .ax6s-upstream-success-marker
+          echo "sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+
+      # 只能在发布成功之后写入；失败、取消、初始化出错均不会误记。
+      - name: 保存已成功构建的上游提交
+        if: steps.upstream_success.outputs.sha != ''
+        uses: actions/cache/save@v4
+        with:
+          path: .ax6s-upstream-success-marker
+          key: AX6S-upstream-success-v2-${{ steps.upstream_success.outputs.sha }}
+
+      # 以下清理步骤不参与判断固件是否已经成功发布。
       - name: Delete workflow runs
         uses: wekingchen/delete-workflow-runs@main
         if: steps.compile.outputs.status == 'success'
+        continue-on-error: true
         with:
           retain_days: 1
           keep_minimum_runs: 10
 
-      # 保留最近八个发布版本，清理更早的版本和标签。
       - name: Remove old Releases
         uses: dev-drprasad/delete-older-releases@v0.3.4
         if: steps.tag.outputs.status == 'success'
+        continue-on-error: true
         with:
           keep_latest: 8
           delete_tags: true

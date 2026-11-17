@@ -1,52 +1,78 @@
-#
-# Copyright (c) 2019-2021 P3TERX <https://p3terx.com>
-#
-# This is free software, licensed under the MIT License.
-# See /LICENSE for more information.
-#
-# https://github.com/P3TERX/Actions-OpenWrt
-# File: .github/workflows/update-checker.yml
-# Description: Source code update checker
-#
 
+# 监控 Passwall 软件包上游更新。
+# 仅在对应提交的固件成功构建并发布后才视为已处理。
+# 旧版 HEAD-* 缓存不再作为成功依据，避免失败后漏编。
 name: Update Checker
-
-env:
-  REPO_URL: https://github.com/Openwrt-Passwall/openwrt-passwall-packages
-  REPO_BRANCH: main
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: 40 */12 * * *
+    - cron: '40 */12 * * *'
+
+env:
+  REPO_URL: https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git
+  REPO_BRANCH: main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ax6s-update-checker
+  cancel-in-progress: false
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
 
     steps:
+      # 只获取上游分支的提交号，不克隆全部软件包。
+      - name: 查询上游最新提交
+        id: remote
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sha=''
+          for attempt in 1 2 3 4 5; do
+            if result=$(timeout 60 git ls-remote --heads "$REPO_URL" "refs/heads/$REPO_BRANCH"); then
+              sha=$(awk 'NR == 1 {print $1}' <<< "$result")
+              if [[ "$sha" =~ ^[a-f0-9]{40}$ ]]; then
+                break
+              fi
+            fi
+            echo "第 ${attempt} 次查询失败，稍后重试"
+            if [ "$attempt" -lt 5 ]; then
+              sleep $((attempt * 5))
+            fi
+          done
+          if ! [[ "$sha" =~ ^[a-f0-9]{40}$ ]]; then
+            echo '::error::无法取得有效的上游提交号，本次不触发构建'
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "上游最新提交：$sha"
 
-    - name: Get Commit Hash
-      id: getHash
-      run: |
-        git clone --depth 1 $REPO_URL -b $REPO_BRANCH .
-        echo "::set-output name=commitHash::$(git rev-parse HEAD)"
+      # 这里查询的缓存由固件构建工作流在“发布成功之后”创建。
+      # 不允许更新检查器预先保存缓存，以免把失败提交误记为成功。
+      - name: 查询已成功构建的提交
+        id: success_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ax6s-upstream-success-marker
+          key: AX6S-upstream-success-v2-${{ steps.remote.outputs.sha }}
 
-    - name: Compare Commit Hash
-      id: cacheHash
-      uses: actions/cache@v4.2.0
-      with:
-        path: .commitHash
-        key: HEAD-${{ steps.getHash.outputs.commitHash }}
+      - name: 已有成功构建时跳过
+        if: steps.success_cache.outputs.cache-hit == 'true'
+        run: |
+          echo '上游当前提交已有成功发布的固件，本轮不重复构建。'
+          test "$(cat .ax6s-upstream-success-marker)" = '${{ steps.remote.outputs.sha }}'
 
-    - name: Save New Commit Hash
-      if: steps.cacheHash.outputs.cache-hit != 'true'
-      run: |
-        echo ${{ steps.getHash.outputs.commitHash }} | tee .commitHash
-
-    - name: Trigger build
-      if: steps.cacheHash.outputs.cache-hit != 'true'
-      uses: peter-evans/repository-dispatch@v1
-      with:
-        token: ${{ secrets.ACTIONS_TRIGGER_PAT }}
-        event-type: Source Code Update
+      # 只在没有“构建+发布成功”记录时发起构建。
+      # 失败后没有记录，下一次定时检查将自动重新尝试。
+      - name: 触发 AX6S 固件编译
+        if: steps.success_cache.outputs.cache-hit != 'true'
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.ACTIONS_TRIGGER_PAT || github.token }}
+          event-type: Source Code Update
+          client-payload: '{"upstream_sha":"${{ steps.remote.outputs.sha }}","upstream_repo":"Openwrt-Passwall/openwrt-passwall-packages"}'

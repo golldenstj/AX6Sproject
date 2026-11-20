@@ -221,3 +221,309 @@ def check_elf(name, data):
         if ptype == 3:  # 动态加载器程序头
             raise RuntimeError(f'{name} 存在动态加载器，拒绝将其封装为静态程序')
         if ptype == 2:  # 动态段：进一步检查是否依赖其它共享库。
+            doff = struct.unpack_from('<Q', data, header + 8)[0]
+            dsize = struct.unpack_from('<Q', data, header + 32)[0]
+            if doff + dsize > len(data):
+                raise RuntimeError(f'{name} ELF 动态段越界')
+            for offset in range(doff, doff + dsize - 15, 16):
+                dtag = struct.unpack_from('<q', data, offset)[0]
+                if dtag == 1:  # 共享库依赖项
+                    raise RuntimeError(f'{name} 仍需要共享库，拒绝静态封装')
+                if dtag == 0:
+                    break
+
+naive_version, naive_archive, naive_digest = get_release(
+    'klzgrad/naiveproxy', lambda tag: f'naiveproxy-{tag}-openwrt-aarch64_cortex-a53-static.tar.xz'
+)
+xray_version, xray_archive, xray_digest = get_release(
+    'XTLS/Xray-core', lambda tag: 'Xray-linux-arm64-v8a.zip'
+)
+sing_version, sing_archive, sing_digest = get_release(
+    'SagerNet/sing-box', lambda tag: f'sing-box-{tag[1:]}-linux-arm64-musl.tar.gz'
+)
+naive_bin = from_tar(naive_archive, 'naive')
+xray_bin = from_zip(xray_archive, 'xray')
+sing_bin = from_tar(sing_archive, 'sing-box', mode='r:gz')
+for name, binary in [('NaiveProxy', naive_bin), ('Xray', xray_bin), ('Sing-box', sing_bin)]:
+    check_elf(name, binary)
+
+naive_pkg = ROOT / 'feeds/packages/net/naiveproxy'
+xray_pkg = ROOT / 'feeds/packages/net/xray-core'
+sing_pkg = ROOT / 'feeds/packages/net/sing-box'
+for path in (
+    naive_pkg / 'files/naiveproxy.init', naive_pkg / 'files/naiveproxy.config',
+    xray_pkg / 'files/xray.init', xray_pkg / 'files/xray.conf',
+    xray_pkg / 'files/config.json.example',
+    sing_pkg / 'files/sing-box.init', sing_pkg / 'files/sing-box.conf',
+):
+    if not path.is_file():
+        raise RuntimeError(f'官方预编译封装所需文件不存在：{path}')
+
+# 保留许可文件，Sing-box 示例配置取同一官方 Release tag 的源码。
+naive_license = from_tar(naive_archive, 'LICENSE')
+xray_license = from_zip(xray_archive, 'LICENSE')
+try:
+    sing_license = from_tar(sing_archive, 'LICENSE', mode='r:gz')
+except RuntimeError:
+    sing_license = download(f'https://raw.githubusercontent.com/SagerNet/sing-box/v{sing_version}/LICENSE')
+sing_example = download(f'https://raw.githubusercontent.com/SagerNet/sing-box/v{sing_version}/release/config/config.json')
+json.loads(sing_example)  # 预检示例配置是有效 JSON
+
+for pkg, filename, data in (
+    (naive_pkg, 'naive', naive_bin), (naive_pkg, 'LICENSE', naive_license),
+    (xray_pkg, 'xray', xray_bin), (xray_pkg, 'LICENSE', xray_license),
+    (sing_pkg, 'sing-box', sing_bin), (sing_pkg, 'LICENSE', sing_license),
+    (sing_pkg, 'config.json', sing_example),
+):
+    dest = pkg / 'files/ax6s-prebuilt' / filename
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(data)
+    dest.chmod(0o755 if filename in ('naive', 'xray', 'sing-box') else 0o644)
+
+# NaiveProxy：仅改变软件包构建方式，继续保留原包名、UCI 与 init 服务。
+naive_make = r'''include $(TOPDIR)/rules.mk
+
+PKG_NAME:=naiveproxy
+PKG_REAL_VERSION:=@VERSION@
+PKG_VERSION:=$(subst -,.,$(PKG_REAL_VERSION))
+PKG_RELEASE:=1
+PKG_LICENSE:=BSD-3-Clause
+PKG_LICENSE_FILES:=LICENSE
+PKG_MAINTAINER:=Tianling Shen <cnsztl@immortalwrt.org>
+PKG_BUILD_DIR:=$(BUILD_DIR)/naiveproxy-$(PKG_REAL_VERSION)
+
+include $(INCLUDE_DIR)/package.mk
+
+define Package/naiveproxy
+  SECTION:=net
+  CATEGORY:=Network
+  SUBMENU:=Web Servers/Proxies
+  TITLE:=Make a fortune quietly
+  URL:=https://github.com/klzgrad/naiveproxy
+  DEPENDS:=@!(arc||armeb||loongarch64||mips||mips64||powerpc||TARGET_gemini) $(ATOMIC64_DEPENDS)
+endef
+
+define Package/naiveproxy/description
+  NaiveProxy uses Chromium's network stack for HTTPS proxy transport.
+endef
+
+define Build/Prepare
+	$(INSTALL_DIR) $(PKG_BUILD_DIR)
+	$(INSTALL_BIN) $(CURDIR)/files/ax6s-prebuilt/naive $(PKG_BUILD_DIR)/naive
+	$(INSTALL_DATA) $(CURDIR)/files/ax6s-prebuilt/LICENSE $(PKG_BUILD_DIR)/LICENSE
+endef
+
+define Build/Configure
+endef
+
+define Build/Compile
+endef
+
+define Package/naiveproxy/conffiles
+/etc/config/naiveproxy
+endef
+
+define Package/naiveproxy/install
+	$(INSTALL_DIR) $(1)/usr/bin
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/naive $(1)/usr/bin/naive
+	$(INSTALL_DIR) $(1)/etc/config $(1)/etc/init.d
+	$(INSTALL_CONF) $(CURDIR)/files/naiveproxy.config $(1)/etc/config/naiveproxy
+	$(INSTALL_BIN) $(CURDIR)/files/naiveproxy.init $(1)/etc/init.d/naiveproxy
+endef
+
+$(eval $(call BuildPackage,naiveproxy))
+'''.replace('@VERSION@', naive_version)
+
+# Xray：保持 xray-core 和 xray-example 的既有包名与服务文件。
+xray_make = r'''include $(TOPDIR)/rules.mk
+
+PKG_NAME:=xray-core
+PKG_VERSION:=@VERSION@
+PKG_RELEASE:=1
+PKG_LICENSE:=MPL-2.0
+PKG_LICENSE_FILES:=LICENSE
+PKG_MAINTAINER:=Tianling Shen <cnsztl@immortalwrt.org>
+PKG_BUILD_DIR:=$(BUILD_DIR)/xray-core-$(PKG_VERSION)
+
+include $(INCLUDE_DIR)/package.mk
+
+define Package/xray/template
+  TITLE:=A proxy platform to bypass network restrictions
+  SECTION:=net
+  CATEGORY:=Network
+  URL:=https://xtls.github.io
+endef
+
+define Package/xray-core
+  $(call Package/xray/template)
+  DEPENDS:=+ca-bundle
+endef
+
+define Package/xray-example
+  $(call Package/xray/template)
+  TITLE+= (example configs)
+  DEPENDS:=+xray-core
+  PKGARCH:=all
+endef
+
+define Package/xray/description
+  Xray is a multi-protocol network proxy platform.
+endef
+
+define Package/xray-core/description
+  $(call Package/xray/description)
+endef
+
+define Package/xray-example/description
+  $(call Package/xray/description)
+endef
+
+define Build/Prepare
+	$(INSTALL_DIR) $(PKG_BUILD_DIR)
+	$(INSTALL_BIN) $(CURDIR)/files/ax6s-prebuilt/xray $(PKG_BUILD_DIR)/xray
+	$(INSTALL_DATA) $(CURDIR)/files/ax6s-prebuilt/LICENSE $(PKG_BUILD_DIR)/LICENSE
+endef
+
+define Build/Configure
+endef
+
+define Build/Compile
+endef
+
+define Package/xray-core/conffiles
+/etc/xray/
+/etc/config/xray
+endef
+
+define Package/xray-core/install
+	$(INSTALL_DIR) $(1)/usr/bin
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/xray $(1)/usr/bin/xray
+	$(INSTALL_DIR) $(1)/etc/xray
+	$(INSTALL_DATA) $(CURDIR)/files/config.json.example $(1)/etc/xray/
+	$(INSTALL_DIR) $(1)/etc/config
+	$(INSTALL_CONF) $(CURDIR)/files/xray.conf $(1)/etc/config/xray
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) $(CURDIR)/files/xray.init $(1)/etc/init.d/xray
+endef
+
+define Package/xray-example/install
+	$(INSTALL_DIR) $(1)/etc/xray
+	$(INSTALL_DATA) $(CURDIR)/files/vpoint_socks_vmess.json $(1)/etc/xray/
+	$(INSTALL_DATA) $(CURDIR)/files/vpoint_vmess_freedom.json $(1)/etc/xray/
+endef
+
+$(eval $(call BuildPackage,xray-core))
+$(eval $(call BuildPackage,xray-example))
+'''.replace('@VERSION@', xray_version)
+
+# Sing-box：完整 ARM64 musl 官方静态程序内含 Naive 出站，不需要编译 libcronet 或 GN。
+# 仅封装完整包；当前 AX6S 并未选择 sing-box-tiny。
+sing_make = r'''include $(TOPDIR)/rules.mk
+
+PKG_NAME:=sing-box
+PKG_VERSION:=@VERSION@
+PKG_RELEASE:=1
+PKG_LICENSE:=GPL-3.0-or-later
+PKG_LICENSE_FILES:=LICENSE
+PKG_MAINTAINER:=Tianling Shen <cnsztl@immortalwrt.org>
+PKG_BUILD_DIR:=$(BUILD_DIR)/sing-box-$(PKG_VERSION)
+
+include $(INCLUDE_DIR)/package.mk
+
+define Package/sing-box
+  SECTION:=net
+  CATEGORY:=Network
+  SUBMENU:=Web Servers/Proxies
+  TITLE:=The universal proxy platform (official ARM64 musl)
+  URL:=https://sing-box.sagernet.org/
+  DEPENDS:=+ca-bundle +kmod-inet-diag +kmod-netlink-diag +kmod-tun
+  USERID:=sing-box=5566:sing-box=5566
+endef
+
+define Package/sing-box/description
+  Official ARM64 musl static build with Naive outbound included.
+endef
+
+define Build/Prepare
+	$(INSTALL_DIR) $(PKG_BUILD_DIR)
+	$(INSTALL_BIN) $(CURDIR)/files/ax6s-prebuilt/sing-box $(PKG_BUILD_DIR)/sing-box
+	$(INSTALL_DATA) $(CURDIR)/files/ax6s-prebuilt/LICENSE $(PKG_BUILD_DIR)/LICENSE
+endef
+
+define Build/Configure
+endef
+
+define Build/Compile
+endef
+
+define Package/sing-box/conffiles
+/etc/config/sing-box
+/etc/sing-box/
+endef
+
+define Package/sing-box/install
+	$(INSTALL_DIR) $(1)/usr/bin
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/sing-box $(1)/usr/bin/sing-box
+	$(INSTALL_DIR) $(1)/etc/sing-box
+	$(INSTALL_DATA) $(CURDIR)/files/ax6s-prebuilt/config.json $(1)/etc/sing-box/config.json
+	$(INSTALL_DIR) $(1)/etc/config $(1)/etc/init.d
+	$(INSTALL_CONF) $(CURDIR)/files/sing-box.conf $(1)/etc/config/sing-box
+	$(INSTALL_BIN) $(CURDIR)/files/sing-box.init $(1)/etc/init.d/sing-box
+endef
+
+$(eval $(call BuildPackage,sing-box))
+'''.replace('@VERSION@', sing_version)
+
+(naive_pkg / 'Makefile').write_text(naive_make)
+(xray_pkg / 'Makefile').write_text(xray_make)
+(sing_pkg / 'Makefile').write_text(sing_make)
+
+# 显式关闭历史源码包，避免 .config 持续强制选择 libcronet。
+# 修改原始配置，防止旧版源码依赖重新进入构建。
+# 不调用 scripts/config，因为它在 ImmortalWrt 中是目录。
+# make defconfig 将在后续工作流中重新解析依赖关系。
+
+disabled = (
+    'PACKAGE_libcronet',
+    'SING_BOX_BUILD_NAIVE_OUTBOUND',
+    'SING_BOX_TINY_BUILD_NAIVE_OUTBOUND',
+)
+
+config_path = ROOT / '.config'
+if not config_path.is_file():
+    raise RuntimeError('找不到 OpenWrt .config，无法清理旧依赖')
+
+config_lines = config_path.read_text().splitlines()
+for symbol in disabled:
+    pattern = re.compile(
+        r'^(?:# )?CONFIG_' + re.escape(symbol) +
+        r'(?:=.*| is not set)$'
+    )
+    config_lines = [
+        line for line in config_lines
+        if not pattern.fullmatch(line)
+    ]
+    config_lines.append(f'# CONFIG_{symbol} is not set')
+
+config_path.write_text('\n'.join(config_lines) + '\n')
+print('[diy-part2] 已禁用本地 libcronet 和 Sing-box 源码 Naive 构建选项')
+
+
+manifest = ROOT / 'ax6s-prebuilt-versions.txt'
+manifest.write_text(
+    'AX6S 官方预编译组件\n'
+    f'NaiveProxy: v{naive_version}\n'
+    f'NaiveProxy 官方归档 SHA256: {naive_digest[7:]}\n'
+    f'Xray-core: v{xray_version}\n'
+    f'Xray 官方归档 SHA256: {xray_digest[7:]}\n'
+    f'Sing-box: v{sing_version} (linux-arm64-musl; 内置 Naive 出站)\n'
+    f'Sing-box 官方归档 SHA256: {sing_digest[7:]}\n'
+    f'NaiveProxy ELF SHA256: {hashlib.sha256(naive_bin).hexdigest()}\n'
+    f'Xray ELF SHA256: {hashlib.sha256(xray_bin).hexdigest()}\n'
+    f'Sing-box ELF SHA256: {hashlib.sha256(sing_bin).hexdigest()}\n'
+)
+print(manifest.read_text(), flush=True)
+print('[diy-part2] 三款官方预编译软件包封装完成；已关闭本地 libcronet 选择。', flush=True)
+PY
+
+echo '[diy-part2] 全部自定义配置完成。'

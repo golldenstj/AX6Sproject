@@ -1,7 +1,7 @@
 #!/bin/bash
 # Redmi AX6S 自定义配置：在 Feeds 安装之后、make defconfig 之前执行。
 # 保留 Rust、Boost、FRP、Firewall4 的既有兼容方案。
-# NaiveProxy、Xray 与 Sing-box 改用官方正式版 ARM64 预编译文件；保持 OpenWrt 软件包及服务集成。
+# NaiveProxy 与 Xray 使用官方正式版 ARM64 预编译文件；保持 OpenWrt 软件包及服务集成。
 set -Eeuo pipefail
 trap 'echo "[diy-part2] 第 ${LINENO} 行执行失败，请检查上方日志" >&2' ERR
 
@@ -131,15 +131,13 @@ print('[diy-part2] FullCone 第一段补丁已适配')
 PY
 
 # 六、官方二进制构建：只接受正式版、校验 Release SHA256、AArch64 与静态链接。
-# 注意 Sing-box 必须选择 linux-arm64-musl；普通 arm64 版需要附带 libcronet.so。
-echo '[diy-part2] 获取 NaiveProxy、Xray 和 Sing-box 官方预编译文件...'
+echo '[diy-part2] 获取 NaiveProxy 和 Xray 官方预编译文件...'
 python3 - <<'PY'
 from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 import hashlib
 import io
-import json
 import os
 import re
 import struct
@@ -238,47 +236,32 @@ naive_version, naive_archive, naive_digest = get_release(
 xray_version, xray_archive, xray_digest = get_release(
     'XTLS/Xray-core', lambda tag: 'Xray-linux-arm64-v8a.zip'
 )
-sing_version, sing_archive, sing_digest = get_release(
-    'SagerNet/sing-box', lambda tag: f'sing-box-{tag[1:]}-linux-arm64-musl.tar.gz'
-)
 naive_bin = from_tar(naive_archive, 'naive')
 xray_bin = from_zip(xray_archive, 'xray')
-sing_bin = from_tar(sing_archive, 'sing-box', mode='r:gz')
-for name, binary in [('NaiveProxy', naive_bin), ('Xray', xray_bin), ('Sing-box', sing_bin)]:
+for name, binary in [('NaiveProxy', naive_bin), ('Xray', xray_bin)]:
     check_elf(name, binary)
 
 naive_pkg = ROOT / 'feeds/packages/net/naiveproxy'
 xray_pkg = ROOT / 'feeds/packages/net/xray-core'
-sing_pkg = ROOT / 'feeds/packages/net/sing-box'
 for path in (
     naive_pkg / 'files/naiveproxy.init', naive_pkg / 'files/naiveproxy.config',
     xray_pkg / 'files/xray.init', xray_pkg / 'files/xray.conf',
     xray_pkg / 'files/config.json.example',
-    sing_pkg / 'files/sing-box.init', sing_pkg / 'files/sing-box.conf',
 ):
     if not path.is_file():
         raise RuntimeError(f'官方预编译封装所需文件不存在：{path}')
 
-# 保留许可文件，Sing-box 示例配置取同一官方 Release tag 的源码。
+# 保留 NaiveProxy 和 Xray 的官方许可文件。
 naive_license = from_tar(naive_archive, 'LICENSE')
 xray_license = from_zip(xray_archive, 'LICENSE')
-try:
-    sing_license = from_tar(sing_archive, 'LICENSE', mode='r:gz')
-except RuntimeError:
-    sing_license = download(f'https://raw.githubusercontent.com/SagerNet/sing-box/v{sing_version}/LICENSE')
-sing_example = download(f'https://raw.githubusercontent.com/SagerNet/sing-box/v{sing_version}/release/config/config.json')
-json.loads(sing_example)  # 预检示例配置是有效 JSON
-
 for pkg, filename, data in (
     (naive_pkg, 'naive', naive_bin), (naive_pkg, 'LICENSE', naive_license),
     (xray_pkg, 'xray', xray_bin), (xray_pkg, 'LICENSE', xray_license),
-    (sing_pkg, 'sing-box', sing_bin), (sing_pkg, 'LICENSE', sing_license),
-    (sing_pkg, 'config.json', sing_example),
 ):
     dest = pkg / 'files/ax6s-prebuilt' / filename
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(data)
-    dest.chmod(0o755 if filename in ('naive', 'xray', 'sing-box') else 0o644)
+    dest.chmod(0o755 if filename in ('naive', 'xray') else 0o644)
 
 # NaiveProxy：仅改变软件包构建方式，继续保留原包名、UCI 与 init 服务。
 naive_make = r'''include $(TOPDIR)/rules.mk
@@ -416,67 +399,8 @@ $(eval $(call BuildPackage,xray-core))
 $(eval $(call BuildPackage,xray-example))
 '''.replace('@VERSION@', xray_version)
 
-# Sing-box：完整 ARM64 musl 官方静态程序内含 Naive 出站，不需要编译 libcronet 或 GN。
-# 仅封装完整包；当前 AX6S 并未选择 sing-box-tiny。
-sing_make = r'''include $(TOPDIR)/rules.mk
-
-PKG_NAME:=sing-box
-PKG_VERSION:=@VERSION@
-PKG_RELEASE:=1
-PKG_LICENSE:=GPL-3.0-or-later
-PKG_LICENSE_FILES:=LICENSE
-PKG_MAINTAINER:=Tianling Shen <cnsztl@immortalwrt.org>
-PKG_BUILD_DIR:=$(BUILD_DIR)/sing-box-$(PKG_VERSION)
-
-include $(INCLUDE_DIR)/package.mk
-
-define Package/sing-box
-  SECTION:=net
-  CATEGORY:=Network
-  SUBMENU:=Web Servers/Proxies
-  TITLE:=The universal proxy platform (official ARM64 musl)
-  URL:=https://sing-box.sagernet.org/
-  DEPENDS:=+ca-bundle +kmod-inet-diag +kmod-netlink-diag +kmod-tun
-  USERID:=sing-box=5566:sing-box=5566
-endef
-
-define Package/sing-box/description
-  Official ARM64 musl static build with Naive outbound included.
-endef
-
-define Build/Prepare
-	$(INSTALL_DIR) $(PKG_BUILD_DIR)
-	$(INSTALL_BIN) $(CURDIR)/files/ax6s-prebuilt/sing-box $(PKG_BUILD_DIR)/sing-box
-	$(INSTALL_DATA) $(CURDIR)/files/ax6s-prebuilt/LICENSE $(PKG_BUILD_DIR)/LICENSE
-endef
-
-define Build/Configure
-endef
-
-define Build/Compile
-endef
-
-define Package/sing-box/conffiles
-/etc/config/sing-box
-/etc/sing-box/
-endef
-
-define Package/sing-box/install
-	$(INSTALL_DIR) $(1)/usr/bin
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/sing-box $(1)/usr/bin/sing-box
-	$(INSTALL_DIR) $(1)/etc/sing-box
-	$(INSTALL_DATA) $(CURDIR)/files/ax6s-prebuilt/config.json $(1)/etc/sing-box/config.json
-	$(INSTALL_DIR) $(1)/etc/config $(1)/etc/init.d
-	$(INSTALL_CONF) $(CURDIR)/files/sing-box.conf $(1)/etc/config/sing-box
-	$(INSTALL_BIN) $(CURDIR)/files/sing-box.init $(1)/etc/init.d/sing-box
-endef
-
-$(eval $(call BuildPackage,sing-box))
-'''.replace('@VERSION@', sing_version)
-
 (naive_pkg / 'Makefile').write_text(naive_make)
 (xray_pkg / 'Makefile').write_text(xray_make)
-(sing_pkg / 'Makefile').write_text(sing_make)
 
 # 显式关闭历史源码包，避免 .config 持续强制选择 libcronet。
 # 修改原始配置，防止旧版源码依赖重新进入构建。
@@ -485,6 +409,8 @@ $(eval $(call BuildPackage,sing-box))
 
 disabled = (
     'PACKAGE_libcronet',
+    'PACKAGE_sing-box',
+    'PACKAGE_luci-app-passwall_INCLUDE_SingBox',
     'SING_BOX_BUILD_NAIVE_OUTBOUND',
     'SING_BOX_TINY_BUILD_NAIVE_OUTBOUND',
 )
@@ -506,7 +432,7 @@ for symbol in disabled:
     config_lines.append(f'# CONFIG_{symbol} is not set')
 
 config_path.write_text('\n'.join(config_lines) + '\n')
-print('[diy-part2] 已禁用本地 libcronet 和 Sing-box 源码 Naive 构建选项')
+print('[diy-part2] 已禁用本地 libcronet、Sing-box 软件包和旧源码选项')
 
 
 manifest = ROOT / 'ax6s-prebuilt-versions.txt'
@@ -516,14 +442,11 @@ manifest.write_text(
     f'NaiveProxy 官方归档 SHA256: {naive_digest[7:]}\n'
     f'Xray-core: v{xray_version}\n'
     f'Xray 官方归档 SHA256: {xray_digest[7:]}\n'
-    f'Sing-box: v{sing_version} (linux-arm64-musl; 内置 Naive 出站)\n'
-    f'Sing-box 官方归档 SHA256: {sing_digest[7:]}\n'
     f'NaiveProxy ELF SHA256: {hashlib.sha256(naive_bin).hexdigest()}\n'
     f'Xray ELF SHA256: {hashlib.sha256(xray_bin).hexdigest()}\n'
-    f'Sing-box ELF SHA256: {hashlib.sha256(sing_bin).hexdigest()}\n'
 )
 print(manifest.read_text(), flush=True)
-print('[diy-part2] 三款官方预编译软件包封装完成；已关闭本地 libcronet 选择。', flush=True)
+print('[diy-part2] 两款官方预编译软件包封装完成；已关闭本地 libcronet 选择。', flush=True)
 PY
 
 echo '[diy-part2] 全部自定义配置完成。'

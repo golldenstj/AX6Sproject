@@ -148,7 +148,6 @@ jobs:
           test -s ax6s-prebuilt-versions.txt
           test -s feeds/packages/net/naiveproxy/files/ax6s-prebuilt/naive
           test -s feeds/packages/net/xray-core/files/ax6s-prebuilt/xray
-          test -s feeds/packages/net/sing-box/files/ax6s-prebuilt/sing-box
 
       - name: SSH connection to Actions
         uses: P3TERX/ssh2actions@v1.0.0
@@ -157,7 +156,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
 
-      # BaseFactory 有自己的包选择，不强制三个代理核心都必须 =y。
+      # BaseFactory 有自己的包选择，不强制两款代理核心都必须 =y。
       # 但如果它们被选择，必须确实使用官方预编译规则。
       - name: Preflight GN dependency and prebuilt package audit
         shell: bash
@@ -179,6 +178,9 @@ jobs:
           config = Path('.config').read_text(errors='replace')
           selected = set(re.findall(r'^CONFIG_PACKAGE_([^=]+)=y$', config, re.M))
 
+          if 'sing-box' in selected or 'luci-app-passwall_INCLUDE_SingBox' in selected:
+              abort('Sing-box 已停用，但配置仍意外选中了它')
+
           if 'libcronet' in selected:
               abort('libcronet 被选中，会引入 GN/Chromium 源码构建')
           if 'iptables-nft' in selected and 'iptables-zz-legacy' in selected:
@@ -187,7 +189,6 @@ jobs:
           expected_packages = {
               'naiveproxy': ('feeds/packages/net/naiveproxy/Makefile', 'naive'),
               'xray-core': ('feeds/packages/net/xray-core/Makefile', 'xray'),
-              'sing-box': ('feeds/packages/net/sing-box/Makefile', 'sing-box'),
           }
           for pkg, (expected, binary) in expected_packages.items():
               active = Path('package/feeds/packages') / pkg / 'Makefile'

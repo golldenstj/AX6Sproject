@@ -1,5 +1,5 @@
 # 红米 AX6S OpenWrt 固件自动构建。
-# NaiveProxy、Xray、Sing-box 使用官方 ARM64 预编译核心，保持现有软件包与服务配置。
+# NaiveProxy、Xray 使用官方 ARM64 预编译核心，保持现有软件包与服务配置。
 # 对 APT 和依赖下载增加重试与校验；仅在固件发布成功后记录自动更新提交。
 name: Build Redmi-MTK-AX6S OpenWrt
 
@@ -191,8 +191,7 @@ jobs:
           test -s ax6s-prebuilt-versions.txt
           test -s feeds/packages/net/naiveproxy/files/ax6s-prebuilt/naive
           test -s feeds/packages/net/xray-core/files/ax6s-prebuilt/xray
-          test -s feeds/packages/net/sing-box/files/ax6s-prebuilt/sing-box
-          echo '三个官方预编译组件准备完成'
+          echo '两款官方预编译组件准备完成'
           cat ax6s-prebuilt-versions.txt
 
       - name: SSH connection to Actions
@@ -223,7 +222,7 @@ jobs:
               r'^CONFIG_PACKAGE_([^=]+)=y$', config, re.M
           ))
 
-          required = {'sing-box', 'naiveproxy', 'xray-core'}
+          required = {'naiveproxy', 'xray-core'}
           missing = required - selected
           if missing:
               abort('以下官方预编译核心未被选中：' + ', '.join(sorted(missing)))
@@ -242,13 +241,15 @@ jobs:
 
           print('[依赖预检] iptables 和 SSR Plus 依赖检查通过')
 
+          if 'sing-box' in selected or 'luci-app-passwall_INCLUDE_SingBox' in selected:
+              abort('Sing-box 已停用，但配置仍意外选中了它')
+
           if 'libcronet' in selected:
               abort('libcronet 仍被选中，可能触发 GN/Chromium 源码编译')
 
           expected_packages = {
               'naiveproxy': ('feeds/packages/net/naiveproxy/Makefile', 'naive'),
               'xray-core': ('feeds/packages/net/xray-core/Makefile', 'xray'),
-              'sing-box': ('feeds/packages/net/sing-box/Makefile', 'sing-box'),
           }
 
           for pkg, (expected, binary) in expected_packages.items():
